@@ -1,40 +1,22 @@
-# Merge into ~/.hermes/config.yaml. Local only: no API keys anywhere.
+# Merge into ~/.hermes/config.yaml.
+#
+# Hermes is no longer on the voice path. Bud-E's agent tier talks to oMLX
+# directly; Hermes only runs background jobs handed to it by the `delegate`
+# tool, where a slow start costs nothing because nobody is waiting.
 
 model:
-  provider: lmstudio
-  default: qwen3.8-27b                # exactly as /v1/models reports it
-  base_url: http://localhost:1234/v1
-  context_length: 64000               # Hermes rejects agent sessions below 64k
-  max_tokens: 1500                    # room for reasoning + reply; the
-                                      # skill is what keeps replies short
-  lmstudio_load_mode: explicit        # `jit` if you use LM Studio auto-evict
-
-# No fallback_providers block. Fallback fires on transport errors and would
-# only ever fail louder without a second provider configured.
-
-# No auxiliary block either. With auxiliary.*.provider left at its default
-# "auto", compression, vision and title generation all route to your main
-# chat model, which is the local 27B. That is what you want here: it keeps
-# the whole system offline. The cost is that compression eats local context,
-# which is why the threshold below is tightened.
-
-# Thinking off. Reasoning tokens are pure latency on a voice path: you escalate
-# for depth, you do not wait 20s for the 27B to deliberate. If the lmstudio
-# provider ignores extra_body, the /no_think line in the bud-e-voice skill is
-# the fallback and works on any transport.
+  provider: custom
+  default: Qwen3.8-27B-MLX-4bit        # exactly as `bud-e doctor` lists it
+  base_url: http://localhost:8250/v1   # oMLX (port from ~/.omlx/settings.json)
+  # api_key: set to oMLX's key, or enable localhost bypass in its admin panel
+  context_length: 64000                # Hermes rejects agent sessions below 64k
+  max_tokens: 4096                     # background jobs may think; no one is waiting
   extra_body:
     chat_template_kwargs:
-      enable_thinking: false
+      enable_thinking: true            # depth is the point of delegating
 
 agent:
-  max_turns: 6                        # local models loop; cap it hard
-
-# Reasoning off at the config level as well as via the CLI --reasoning flag
-# and the /no_think suffix. Three belts, because which one bites depends on
-# the provider and the build.
-reasoning:
-  effort: low
-  include_in_history: false
+  max_turns: 12                        # longer leash than voice, still capped
 
 compression:
-  threshold: 0.7                      # compress earlier than default at 64k
+  threshold: 0.7

@@ -11,73 +11,72 @@ uv pip install -r requirements.txt          # bench only, ~20MB
 uv pip install -r requirements-voice.txt    # torch, speechbrain, whisper
 ```
 
-## 2. Models in LM Studio
+## 2. Serve the models with oMLX
 
-Load both. Set context explicitly; auto-detect can come back under 64k and
-Hermes will refuse the session at startup.
+Use the oMLX menu bar app; there is no `omlx serve` to run. With
+`auto_start_on_launch` on (the default), the server starts when the app opens,
+on the port in `~/.omlx/settings.json` (8250 here). Bud-E reads that port and
+the API key from the same file.
+
+- Add oMLX to System Settings → General → Login Items so it is always up.
+- Cache settings already live in the app: SSD cache on, hot cache 6GB.
+- Optional, resets on reboot: `sudo sysctl iogpu.wired_limit_mb=40960`.
+  Without it Apple's default cap (~37GB) applies, enough for Qwen and Gemma.
+- Gemma lives in LM Studio's folder; it is symlinked into `~/.omlx/models`.
+  oMLX scans models only at startup, so restart the app after adding one.
+
+In the admin panel, for the Qwen 27B:
+
+| setting | value |
+| --- | --- |
+| quant | 4-bit (or 4-bit DWQ). 6-bit only if the bench behaviour score is under 85% |
+| pin | on, no TTL. An eviction costs a reload and a cold prefill |
+| context | 64k (Hermes needs it for delegate jobs); 32k if you never delegate |
+| chat template kwargs | `enable_thinking: false` as the default |
+| sampling | temp 0.7, top_p 0.8, top_k 20, min_p 0, presence 1.5 |
+
+Bud-E sends the sampling and thinking switch on every request anyway, so the
+panel values only matter for other clients. Pin Gemma 4 E4B too if the fast
+tier stays on.
+
+Bud-E reads the port and API key from `~/.omlx/settings.json`, so no exports
+are needed. Override with `BUD_E_BASE`, `BUD_E_API_KEY`, `BUD_E_MODEL` if you
+change models.
 
 ```bash
-lms load qwen3.8-27b-uncensored-mlx --context-length 64000
-lms load google/gemma-4-e4b --context-length 8192
-lms server start
-lms ps
+python -m bud_e.cli doctor
 ```
 
-In each model's gear panel: Flash Attention on. For GGUF builds, set K and V
-cache quantisation to Q8_0 (the option only appears once Flash Attention is
-enabled). Save as per-model defaults so a reload does not drop them.
-
-## 3. Benchmark before you trust either model
+## 3. Benchmark before you trust the model
 
 ```bash
-python -m bench.cli models
-python -m bench.cli run --model qwen3.8-27b-uncensored-mlx --runs 3
-python -m bench.cli run --model google/gemma-4-e4b --runs 3
+python -m bench.cli run --model "$BUD_E_MODEL" --runs 3
 python -m bench.cli report
+python -m bud_e.cli latency
 ```
 
-Targets: reply under 1.50s, throughput over 20 tok/s, behaviour at 85% or
-better, zero malformed tool arguments. Behaviour is the number that decides.
-Below 85% no prompt work will save it and the answer is a different model.
+Targets: behaviour 85% or better, zero malformed tool arguments, warm TTFT
+under 0.8s, decode over 15 tok/s (speech only needs about 4.5). If `latency`
+says warm is barely faster than cold, the prefix cache is not hitting and
+nothing else matters until it does.
 
-If the `thinking` line is not 0, reasoning is still on and that is where your
-latency is going. Check LM Studio's reasoning toggle in the gear panel.
-
-## 4. Hermes
+## 4. Tools, in text, before the microphone
 
 ```bash
-hermes model
+brew install ical-buddy          # calendar incl. recurring events
+python -m bud_e.cli chat
 ```
 
-Custom OpenAI-compatible endpoint → `http://localhost:1234/v1` → blank key →
-API mode **2, Chat Completions** → pick the Qwen → context **64000** → display
-name `Bud-E`.
+Try: "what's on tomorrow", "remind me to call the plumber Tuesday at four",
+"will it rain today", "I prefer black coffee" then "how do I take my coffee".
+macOS asks once for Calendar and Reminders access for your terminal.
 
-Verify, because this is the step that silently leaves you on a remote model:
-
-```bash
-hermes config get model.provider     # custom
-hermes config get model.default      # your qwen
-hermes chat                          # banner bottom-left names your model
-```
-
-Then the config fragment and the skill:
+Optional background jobs via Hermes:
 
 ```bash
-cat hermes/config.yaml               # merge into ~/.hermes/config.yaml
+cat hermes/config.yaml           # merge into ~/.hermes/config.yaml
 cp -r hermes/skills/bud-e-voice ~/.hermes/skills/
-hermes skills list | grep bud-e-voice
 ```
-
-Prove it in text before touching the microphone:
-
-```bash
-hermes chat --oneshot -Q -c bud-e-voice --create-if-missing \
-  -t file,skills,memory -s bud-e-voice -q "what day is it /no_think"
-```
-
-Two spoken sentences, no markdown. If you get an essay with headings, the
-skill is not being applied and the voice path will inherit that.
 
 ## 5. Voice enrolment
 
@@ -111,11 +110,12 @@ you speak to it.
 ./run.sh
 ```
 
-Startup pays the ~25s Hermes prefill once. Then:
+Startup prefills the agent prompt once (a second or two). Then:
 
 - "what time is it"  → trigger, instant
 - "how's it going"   → fast tier, about a second
-- "remind me to call the plumber" → Hermes, three to five seconds
+- "remind me to call the plumber at six" → agent + set_reminder, a second or two
+- "plan out my week" → agent with thinking, a few seconds after "give me a moment"
 
 Interrupt it mid-sentence to test barge-in. Have someone else speak to confirm
 the speaker gate rejects them.
@@ -124,7 +124,7 @@ the speaker gate rejects them.
 
 ```bash
 python -m bud_e.cli profile     # per-stage timing, median and share
-python -m bud_e.cli latency     # splits LLM time: spawn vs model vs hermes
+python -m bud_e.cli latency     # cold vs warm TTFT, decode, fast tier verdict
 ```
 
 Optimise the largest share. Anything under 15% is not worth touching however
@@ -134,11 +134,10 @@ slow it feels.
 
 | symptom | cause |
 | --- | --- |
-| `APIConnectionError` | LM Studio server not started: `lms server start` |
-| "No session found matching" | missing `--create-if-missing` |
-| replies are markdown essays | skill not applied; check `hermes skills list` |
-| first turn ~25s, rest fast | normal cold prefill, warm-up handles it |
-| every turn slow | check `hermes chat` banner names your local model |
+| `APIConnectionError` | oMLX not running, or `BUD_E_BASE` wrong |
+| tools never called | bench behaviour score; try lower `BUD_E_PRESENCE` |
+| every turn as slow as the first | prefix cache not hitting: `bud-e latency` |
+| calendar empty but you have events | install icalBuddy; grant Calendar access |
 | Bud-E interrupts itself | raise `BUD_E_BARGE_RMS`, or wear headphones |
 | it ignores your interruption | lower `BUD_E_BARGE_RMS` |
 | cut off mid-thought | raise `BUD_E_SILENCE_MS` |
