@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timezone
 
 from bud_e import config as C
-from bud_e.llm import local
+from bud_e.llm import local, sampling
 from bench.cases import CASES, SYSTEM, TOOLS
 
 
@@ -23,7 +23,8 @@ def _reasoning(delta) -> str:
 def one_turn(client, model: str, prompt: str, expected, think: bool = False):
     # Qwen's soft switch is parsed from the latest USER message, not the
     # system prompt. Putting it in the system block does nothing.
-    user = prompt if think else prompt + " /no_think"
+    from datetime import datetime as _dt
+    user = f"[{_dt.now():%a %-d %b %Y, %H:%M}] {prompt}"
     msgs = [{"role": "system", "content": SYSTEM},
             {"role": "user", "content": user}]
     t0 = time.perf_counter()
@@ -35,11 +36,9 @@ def one_turn(client, model: str, prompt: str, expected, think: bool = False):
     text = ""
     calls: dict[int, dict] = {}
 
-    kwargs = dict(model=model, messages=msgs, tools=TOOLS,
-                  temperature=0.3, max_tokens=1200, stream=True,
-                  stream_options={"include_usage": True})
-    if not think:
-        kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+    kwargs = dict(model=model, messages=msgs, tools=TOOLS, stream=True,
+                  stream_options={"include_usage": True},
+                  **sampling(think, 4096 if think else 1200))
 
     try:
         stream = client.chat.completions.create(**kwargs)
@@ -80,12 +79,11 @@ def one_turn(client, model: str, prompt: str, expected, think: bool = False):
         except json.JSONDecodeError:
             malformed = True
 
-    if expected == "ESCALATE":
-        correct = text.strip().upper().startswith("ESCALATE")
-    elif expected is None:
-        correct = not names and not text.strip().upper().startswith("ESCALATE")
+    if expected is None:
+        correct = not names and bool(text.strip())
     else:
-        correct = expected in names
+        ok = expected if isinstance(expected, tuple) else (expected,)
+        correct = any(e in names for e in ok)
 
     gen = total_tok if total_tok else (n_tok + n_think)
     return {"prompt": prompt, "expected": expected, "called": names,

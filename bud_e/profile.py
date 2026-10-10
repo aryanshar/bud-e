@@ -45,7 +45,7 @@ class Turn:
 
 def summarise() -> None:
     if not C.TURN_LOG.exists():
-        raise SystemExit(f"no turns logged yet — run `bud-e run` first")
+        raise SystemExit("no turns logged yet, run `bud-e run` first")
 
     rows = []
     for line in C.TURN_LOG.open():
@@ -73,5 +73,14 @@ def summarise() -> None:
     print("  " + "-" * 38)
     print(f"  {'total':<12} {stats.median(totals):7.2f}s "
           f"{sorted(totals)[max(0, int(len(totals) * 0.9) - 1)]:7.2f}s")
+
+    # Time to first audio: what the conversation actually feels like.
+    tiers = sorted({r.get("tier") for r in rows if "ttfa" in r})
+    if tiers:
+        print("\n  first audio  (from routing to first spoken sentence)")
+        for t in tiers:
+            v = sorted(r["ttfa"] for r in rows if r.get("tier") == t and "ttfa" in r)
+            print(f"  {t:<12} {stats.median(v):7.2f}s {v[max(0, int(len(v) * 0.9) - 1)]:7.2f}s  n={len(v)}")
+
     print("\n  The largest share is where optimisation pays. Anything under")
     print("  15% is not worth touching however slow it feels.\n")

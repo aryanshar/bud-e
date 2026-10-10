@@ -35,7 +35,7 @@ def check_config_refs() -> list[str]:
 def check_imports() -> list[str]:
     problems = []
     for mod in ["bud_e.config", "bud_e.router", "bud_e.profile",
-                "bud_e.llm", "bud_e.triggers", "bud_e.fast",
+                "bud_e.llm", "bud_e.tools", "bud_e.agent", "bud_e.triggers", "bud_e.fast",
                 "bud_e.asr", "bud_e.audio", "bud_e.speaker",
                 "bud_e.ear", "bud_e.cli",
                 "bench.cases", "bench.runner", "bench.report", "bench.cli"]:
