@@ -1,163 +1,225 @@
 """The loop.
 
-Three tiers. Triggers answer in milliseconds. The fast model answers
-conversation in about a second, streaming sentence by sentence so speech
-starts before generation finishes. Hermes and the 27B handle anything that
-needs tools, memory or real thought, and you wait for those on purpose.
+The microphone is read on the main thread and never blocks, so speech onset
+can interrupt Bud-E mid-sentence. Each utterance is handled on one worker
+thread; a newer utterance bumps the epoch and the old one stops speaking and
+stops generating.
+
+Tiers:
+  0  triggers   regex, no model, milliseconds
+  1  fast       small model, no tools, streamed (optional, BUD_E_FAST_TIER)
+  2  agent      the 27B direct: tools, memory, streamed, thinking on demand
 """
 
+import random
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
 from bud_e import config as C
-from bud_e import llm
+from bud_e import tools
+from bud_e.agent import Agent
 from bud_e.asr import transcribe
 from bud_e.audio import Speaker, listen
 from bud_e.fast import Fast
-from bud_e.llm import escalation_target, hermes, log_escalation
 from bud_e.profile import Turn
-from bud_e.router import needs_hermes
+from bud_e.router import route
 from bud_e.speaker import embed, encoder, load_voiceprint
 from bud_e.triggers import match
 
 WAKE = re.compile(r"\b(bud[\s-]?e|buddy|jarvis)\b", re.I)
-FILLER = "one moment"
-DECLINE = "that one's beyond me locally. I've noted it down."
+# Said the instant a turn needs a tool or thought, the way a person says
+# "hang on" before they look something up. Varied so it never sounds canned.
+CHECKING = ["Hang on.", "One sec.", "Let me look.", "Checking.", "Mm, one moment."]
+THINKING = ["Hm, let me think about that.", "Give me a second on that one.",
+            "Okay, thinking."]
 
-_pool = ThreadPoolExecutor(max_workers=1)
 _epoch = 0
+_busy = threading.Event()
+_pending: list[str] = []          # background results waiting for a gap
+_last_turn = 0.0
+_worker = ThreadPoolExecutor(max_workers=1)
 voice = Speaker()
 fast = Fast()
+agent = Agent()
 
 
-def barge_in() -> None:
+def barge_in(level: float) -> None:
+    """Speech onset. While Bud-E talks, its own voice reaches the mic, so an
+    interruption there has to be louder than the echo."""
     global _epoch
-    if voice.speaking or llm.busy():
+    if voice.speaking:
+        if level < C.BARGE_RMS_SPEAKING:
+            return
+    elif level < C.BARGE_RMS:
+        return
+    if voice.speaking or _busy.is_set():
         _epoch += 1
-        print("  [interrupted]")
+        print(f"  [interrupted, level {level:.3f}]")
     voice.stop()
-    llm.cancel()
 
 
-def slow_turn(text: str) -> str:
-    """Hermes and the 27B. Tools, memory, skills, and the wait that buys."""
-    reply = hermes(text)
-    if not reply:
-        return ""
-    target = escalation_target(reply)
-    if target is None:
-        return reply
+def announce(msg: str) -> None:
+    """Called from a background Hermes job when it finishes."""
+    print(f"  [background done] {msg[:120]}")
+    if _busy.is_set() or voice.speaking:
+        _pending.append(msg)
+    else:
+        voice.say(msg)
 
-    log_escalation(target or text)
-    if not C.CLOUD_ENABLED:
-        print("  [declined, logged]")
-        return DECLINE
-    print("  [escalating]")
-    voice.say(FILLER)
-    return hermes(target or text, big=True)
+
+def speak_stream(gen, epoch: int, T: Turn, t0: float) -> tuple[list[str], bool]:
+    """Speak sentences as they arrive. Returns (said, routed)."""
+    said: list[str] = []
+    try:
+        for kind, s in gen:
+            if epoch != _epoch:
+                break
+            if kind == "route":
+                return said, True
+            if kind == "tool":
+                print(f"  [tool {s}]")
+                continue
+            if not said:
+                T.meta["ttfa"] = round(time.perf_counter() - t0, 3)
+            said.append(s)
+            if not voice.say_now(s):
+                break
+    finally:
+        gen.close()
+    return said, False
+
+
+def handle(seg: np.ndarray, epoch: int, centroid, thr: float) -> None:
+    global _last_turn
+    T = Turn()
+    with T.stage("embed"):
+        score = float(embed(seg) @ centroid)
+    if score < thr:
+        print(f"  [ignored, speaker score {score:.2f}]")
+        return
+
+    with T.stage("asr"):
+        text = transcribe(seg)
+    if not text or epoch != _epoch:
+        return
+    print(f"you ({score:.2f}) > {text}")
+
+    awake = time.time() - _last_turn < C.FOLLOWUP_WINDOW_S
+    if not (awake or WAKE.search(text)):
+        print("  [no wake phrase]")
+        return
+    query = WAKE.sub("", text).strip(" ,.")
+    if not query:
+        voice.say(f"{C.ADDRESS.capitalize()}?")
+        _last_turn = time.time()
+        return
+
+    _busy.set()
+    try:
+        _turn(query, epoch, T)
+    finally:
+        _busy.clear()
+        _last_turn = time.time()
+        while _pending and epoch == _epoch:
+            voice.say_now(_pending.pop(0))
+
+
+def _turn(query: str, epoch: int, T: Turn) -> None:
+    # --- tier 0: triggers ----------------------------------------------
+    trigger, m = match(query)
+    if trigger:
+        with T.stage("llm"):
+            reply = trigger.action(m)
+        if reply:
+            voice.say(reply)
+            print(f"bud-e [trigger] > {reply}")
+        T.meta["tier"] = "trigger"
+        T.save()
+        print(T.line() + "\n")
+        return
+
+    tier, think, reason = route(query)
+    t0 = time.perf_counter()
+
+    # --- tier 1: fast model --------------------------------------------
+    if tier == "fast":
+        with T.stage("llm"):
+            try:
+                said, routed = speak_stream(fast.turn(query), epoch, T, t0)
+            except Exception as e:
+                print(f"  [fast tier failed: {str(e)[:80]}]")
+                said, routed = [], True
+        if not routed:
+            if said:
+                print(f"bud-e [fast] > {' '.join(said)}")
+                agent.note(query, " ".join(said))
+            T.meta.update(tier="fast", chars=len(" ".join(said)))
+            T.save()
+            print(T.line() + "\n")
+            return
+        reason = "fast declined"
+
+    # --- tier 2: agent -------------------------------------------------
+    print(f"  [-> agent: {reason}{', thinking' if think else ''}]")
+    if think:
+        voice.say(random.choice(THINKING))
+    elif reason == "needs tools":
+        voice.say(random.choice(CHECKING))
+    with T.stage("llm"):
+        try:
+            said, _ = speak_stream(
+                agent.turn(query, think=think,
+                           cancelled=lambda: epoch != _epoch),
+                epoch, T, t0)
+        except Exception as e:
+            print(f"  [agent failed: {str(e)[:160]}]")
+            voice.say("something went wrong on my end.")
+            said = []
+    if epoch != _epoch:
+        print("  [discarded, superseded]\n")
+        return
+    print(f"bud-e [agent] > {' '.join(said)}")
+    if said:
+        fast.note(query, " ".join(said))
+    T.meta.update(tier="agent", reason=reason, think=think,
+                  chars=len(" ".join(said)))
+    T.save()
+    print(T.line() + "\n")
 
 
 def run() -> None:
     centroid, thr = load_voiceprint()
+    tools.on_delegate_done = announce
+
     print("warming models...")
     encoder()
     transcribe(np.zeros(C.SR, dtype="float32"))
-
-    # Cold prefill of the 13k-token Hermes prompt costs ~25s. Pay it once
-    # here rather than on the first thing you say.
-    print("warming hermes (~25s the first time)...")
+    print(f"  voice: {voice.warm()}")
     t0 = time.time()
-    hermes("hi")
-    print(f"  prefill {time.time() - t0:.1f}s")
+    ptok = agent.warm()          # system prompt + tool schemas into the cache
+    print(f"  agent prefill {time.time() - t0:.1f}s, prompt {ptok} tokens")
+    if 0 < ptok < 2100:
+        print("  [warning] agent prompt is under oMLX's 2048-token cache block;"
+              " every turn will re-prefill. See bud_e/persona.py.")
+    if C.FAST_TIER:
+        try:
+            next(fast.turn("hi"), None)
+            fast.reset()
+        except Exception as e:
+            print(f"  [fast tier unavailable: {str(e)[:80]}]")
 
-    print(f"bud-e listening (threshold {thr:.2f}). ctrl-c to stop.")
-    last_turn = 0.0
+    print(f"bud-e listening (threshold {thr:.2f}, tools: "
+          f"{', '.join(tools.REGISTRY)}). ctrl-c to stop.")
+
+    def safe(seg, epoch):
+        try:
+            handle(seg, epoch, centroid, thr)
+        except Exception as e:
+            print(f"  [turn failed: {type(e).__name__}: {str(e)[:160]}]")
 
     for seg in listen(on_speech_start=barge_in):
-        epoch = _epoch
-        T = Turn()
-
-        with T.stage("embed"):
-            score = float(embed(seg) @ centroid)
-        if score < thr:
-            print(f"  [ignored, speaker score {score:.2f}]")
-            continue
-
-        with T.stage("asr"):
-            text = transcribe(seg)
-        if not text:
-            continue
-        print(f"you ({score:.2f}) > {text}")
-
-        awake = time.time() - last_turn < C.FOLLOWUP_WINDOW_S
-        if not (awake or WAKE.search(text)):
-            print("  [no wake phrase]")
-            continue
-        query = WAKE.sub("", text).strip(" ,.")
-
-        # --- tier 0: triggers ------------------------------------------
-        trigger, m = match(query)
-        if trigger:
-            with T.stage("llm"):
-                reply = trigger.action(m)
-            if reply:
-                voice.say(reply)
-                print(f"bud-e [trigger] > {reply}")
-            T.meta = {"tier": "trigger"}
-            T.save()
-            print(T.line() + "\n")
-            last_turn = time.time()
-            continue
-
-        # --- tier 1: fast model, streamed ------------------------------
-        reason = needs_hermes(query)
-        spoke = False
-        if reason is None:
-            with T.stage("llm"):
-                said: list[str] = []
-                routed = False
-                try:
-                    for kind, sentence in fast.turn(query):
-                        if kind == "route":
-                            routed = True
-                            break
-                        if epoch != _epoch:
-                            break
-                        said.append(sentence)
-                        spoke = True
-                        if not voice.say_now(sentence):
-                            break
-                except Exception as e:
-                    print(f"  [fast tier failed: {str(e)[:80]}]")
-                    routed = True
-            if not routed and said:
-                print(f"bud-e [fast] > {' '.join(said)}")
-                T.meta = {"tier": "fast", "chars": len(" ".join(said))}
-                T.save()
-                print(T.line() + "\n")
-                last_turn = time.time()
-                continue
-            reason = "fast declined"
-
-        # --- tier 2: hermes + 27b --------------------------------------
-        print(f"  [-> hermes: {reason}]")
-        if not spoke:
-            voice.say(FILLER)
-        with T.stage("llm"):
-            fut = _pool.submit(slow_turn, query)
-            reply = fut.result()
-
-        if epoch != _epoch or not reply:
-            print("  [discarded, superseded]\n")
-            continue
-
-        with T.stage("tts_start"):
-            voice.say(reply)
-        print(f"bud-e [hermes] > {reply}")
-        T.meta = {"tier": "hermes", "reason": reason, "chars": len(reply)}
-        T.save()
-        print(T.line() + "\n")
-        last_turn = time.time()
+        _worker.submit(safe, seg, _epoch)

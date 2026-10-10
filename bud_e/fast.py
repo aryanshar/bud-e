@@ -10,31 +10,12 @@ from collections.abc import Iterator
 
 from bud_e import config as C
 from bud_e.llm import local
+from bud_e.persona import fast_prompt
 
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
-BASE = f"""You are Bud-E, {{addr}}'s voice assistant. You are spoken aloud, so:
-
-- One or two sentences. Never more unless asked to go on.
-- No markdown, no lists, no headings, no URLs, no emoji.
-- Numbers as spoken: "about forty five thousand", not "44,873".
-- Answer first. Never restate the question.
-- Dry, calm, faintly amused. Address them as {{addr}} occasionally, not every line.
-- You are talking, not writing. Contractions, plain words, no preamble.
-
-You have no tools, no memory, no internet, and no access to files or calendars.
-If the request needs any of those, or needs real reasoning, multi-step work, or
-anything you would have to guess at, reply with exactly {C.ROUTE_TOKEN} and
-nothing else. A colleague with tools will take it. Do not apologise, do not
-explain, do not attempt it.
-
-Answer directly when it is conversation, general knowledge you are confident
-about, or anything about the moment you are both in."""
-
-
 def system_prompt() -> str:
-    s = BASE.replace("{addr}", C.ADDRESS)
-    return s + ("\n\n" + C.PERSONA if C.PERSONA else "")
+    return fast_prompt(C.ADDRESS, C.ROUTE_TOKEN, C.PERSONA)
 
 
 class Fast:
@@ -45,6 +26,12 @@ class Fast:
 
     def reset(self) -> None:
         self.history.clear()
+
+    def note(self, user: str, reply: str) -> None:
+        """Record a turn the agent answered, so follow-ups make sense here."""
+        self.history += [{"role": "user", "content": user},
+                         {"role": "assistant", "content": reply}]
+        self._trim()
 
     def _trim(self) -> None:
         keep = C.FAST_HISTORY * 2
@@ -60,7 +47,7 @@ class Fast:
 
         stream = local().chat.completions.create(
             model=C.FAST_MODEL, messages=msgs, stream=True,
-            temperature=0.6, max_tokens=C.FAST_MAX_TOKENS)
+            temperature=0.8, top_p=0.95, max_tokens=C.FAST_MAX_TOKENS)
 
         buf, full, decided = "", "", False
         for chunk in stream:

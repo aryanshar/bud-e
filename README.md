@@ -8,35 +8,52 @@ mic → Silero VAD → ECAPA speaker check → Whisper
                         ↓ (not you)          ↓
                      discarded            router
                                              │
-        ┌────────────────────────────────────┼──────────────────────────┐
-        ↓                                    ↓                          ↓
-  tier 0: triggers              tier 1: Gemma 4 E4B          tier 2: Hermes + Qwen 27B
-  regex, no model               direct, no tools             tools, skills, memory
-  ~10ms                         ~1s, streamed                ~3-5s
-                                     │ ROUTE ─────────────────────→ ┘
+        ┌──────────────────────┬─────────────┴────────────────────┐
+        ↓                      ↓                                  ↓
+  tier 0: triggers     tier 1: Gemma 4 E4B (optional)   tier 2: Qwen 27B agent
+  regex, no model      no tools, streamed               direct to oMLX, streamed,
+  ~10ms                ~0.5s to first word              native tool calls,
+                            │ ROUTE ───────────────────→  thinking on demand
+                                                         ~0.5–1s to first word
+                                                                  │ delegate
+                                                                  ↓
+                                                      Hermes, background only
 ```
 
-Tier 1 streams sentence by sentence, so speech starts before generation
-finishes. Tier 2 is where you wait on purpose.
+Every model tier streams sentence by sentence, so speech starts at the first
+full stop. The mic runs on its own thread, so speaking over Bud-E stops it
+mid-sentence and cancels generation.
 
 ## Tiers
 
 | tier | model | prompt | when |
 | --- | --- | --- | --- |
-| triggers | none | none | time, date, volume, thanks, stop |
-| fast | `google/gemma-4-e4b` | ~200 tok | conversation, general knowledge |
-| hermes | `qwen3.8-27b-uncensored-mlx` | ~13k tok | tools, memory, files, web, depth |
+| triggers | none | none | time, date, volume, weather one-liner, thanks, stop |
+| fast | `gemma-4-E4B-it-MLX-4bit` | ~200 tok | chat; off with `BUD_E_FAST_TIER=0` |
+| agent | `Qwen3.8-27B-MLX-4bit` | ~1.5k tok, frozen | tools, memory, depth |
+| delegate | Hermes + the same 27B | ~13k tok | long jobs, answered later |
 
-`bud_e/router.py` hard-routes to Hermes on tool words, depth words, or turns
-over 28 words. Everything else tries the fast tier, which emits `ROUTE` when
-it cannot cope. The model reports failure; it never predicts difficulty.
+`bud_e/router.py` sends tool words and long turns to the agent, and depth
+words (prove, design, debug, plan out) to the agent with thinking on.
+Everything else tries the fast tier, which emits `ROUTE` when it cannot cope.
 
-Load both in LM Studio, they coexist in 48GB:
+The agent's system prompt never changes; the date and time ride at the front
+of each user message. That keeps the server's prefix cache hitting on every
+turn, which is most of the latency win over the old Hermes path.
+
+### Agent tools
+
+`remember`, `recall` (`~/.bud-e/memory.md`), `add_note`, `read_notes`,
+`find_files`, `read_file` (read-only, inside `BUD_E_READ_ROOTS`),
+`get_calendar` (icalBuddy, AppleScript fallback), `set_reminder`,
+`list_reminders` (Reminders.app), `get_weather` (Open-Meteo, no key),
+`web_search` (only if `BUD_E_SEARXNG` points at a local SearXNG), and
+`delegate` (only if `hermes` is on PATH).
+
+Test them in text before using the mic:
 
 ```bash
-lms load qwen3.8-27b-uncensored-mlx --context-length 64000
-lms load google/gemma-4-e4b --context-length 8192
-lms ps
+python -m bud_e.cli chat            # add --think for depth mode
 ```
 
 ## Setup
@@ -64,8 +81,7 @@ alias bud-e='python -m bud_e.cli'
 
 ## 1. Benchmark
 
-Load a model in LM Studio at 64k context with Q8_0 KV cache, start the server,
-then:
+Serve the model from oMLX (SETUP.md step 2), then:
 
 ```bash
 python -m bench.cli models                      # what the endpoint has loaded
@@ -74,7 +90,8 @@ python -m bench.cli run --model qwen3.8-27b-abliterated --runs 3
 python -m bench.cli report
 ```
 
-Eight cases cover tool selection, plain answers, and the ESCALATE contract.
+Ten cases cover tool selection and plain answers, using the agent's real
+system prompt and tool schemas.
 Targets: median TTFT under 1.00s, mean throughput above 20 tok/s, behaviour at
 85% or better, zero malformed tool arguments.
 
@@ -84,59 +101,16 @@ quant. Re-run after any change to quant, context length, or KV cache type;
 those settings interact in ways that are not obvious.
 
 ```bash
-export BUD_E_MODEL=qwen3.8-27b-uncensored     # the winner
+export BUD_E_MODEL=Qwen3.8-27B-MLX-4bit     # the winner
 ```
 
 ### Thinking
 
-Qwen3.x reasons before answering, and on a voice path that is pure latency:
-400 reasoning tokens at 17 tok/s is 23 seconds of silence. The soft switch is
-parsed from the latest **user** message, not the system prompt, so `/no_think`
-is appended to the query in both the bench and `bud_e/llm.py`. The bench
-`thinking` line should read 0. If it does not, check LM Studio's reasoning
-toggle in the model's gear panel before doing more prompt archaeology.
-
-Keep `max_tokens` generous. At 400 the model spends the whole budget reasoning
-and emits no content at all, which shows up as an empty reply rather than as
-an error.
-
-## 2. Wire Hermes
-
-```bash
-hermes model                       # → LM Studio → localhost:1234/v1
-cat hermes/config.yaml             # merge into ~/.hermes/config.yaml
-cp -r hermes/skills/bud-e-voice ~/.hermes/skills/
-hermes prompt-size                 # want under ~8k
-python -m bud_e.cli doctor
-```
-
-Prove it in text before touching the microphone:
-
-```bash
-hermes chat --oneshot -Q -c bud-e -t file,web,skills,memory -s bud-e-voice \
-  -q "what day is it"
-```
-
-Two spoken sentences. Then ask it to prove something hard; it should return
-`ESCALATE:` and nothing else. If it attempts the proof, the skill is not
-loading.
-
-## Local only
-
-No API keys. There is no cloud tier unless you explicitly turn one on. When the
-27B declines a turn, Bud-E says so and appends the request to
-`~/.bud-e/escalations.log`. After a week that file answers the question
-empirically: if it is nearly empty, you never needed a second tier; if it fills
-up with the same kind of request, you know exactly what you would be paying for.
-
-To turn escalation on later:
-
-```bash
-echo "ANTHROPIC_API_KEY=sk-ant-..." >> ~/.hermes/.env
-export BUD_E_CLOUD=1
-```
-
-Both are required. A key alone does nothing.
+Qwen thinks by default, and on a voice path that is silence. Every request
+sends `chat_template_kwargs.enable_thinking=false` except turns the router
+marks as depth. The bench `thinking` line should read 0; `bud-e doctor`
+checks it too. If it does not, oMLX is not passing the kwarg through: set it
+in the model's chat template kwargs in the admin panel.
 
 ## 3. Voice
 
@@ -161,13 +135,10 @@ One and two exercise the speaker gate, wake phrase, follow-up window, and
 session continuity. Three should print `[ignored, speaker score 0.xx]` and stay
 silent.
 
-Expect two to four seconds per reply. That is where a 27B lands on this
-hardware. Bud-E speaks a short acknowledgement while the model works, and the
-mic is drained afterwards so it does not hear its own voice. The two levers
-that actually reduce latency are the trigger table, which returns in
-milliseconds, and moving off `hermes chat --oneshot` to `hermes serve` to skip
-per-turn process startup. Do neither until you have lived with it for a few
-days and the escalation log tells you which turns are worth the effort.
+Expect under a second to the first word on chat and simple tool turns once
+the prefix cache is warm, and a few seconds on thinking turns (Bud-E says
+"give me a moment" first). `bud-e latency` tells you whether the cache is
+hitting and whether the fast tier is worth its memory.
 
 Speaker verification is a filter, not a lock. It keeps a housemate or the
 television out. It does not survive a recording of you played at the mic, so
@@ -179,7 +150,7 @@ Every turn logs its stage timings to `~/.bud-e/turns.jsonl`.
 
 ```bash
 python -m bud_e.cli profile     # median, p90 and share per stage
-python -m bud_e.cli latency     # splits LLM time: spawn vs model vs hermes
+python -m bud_e.cli latency     # cold vs warm TTFT, decode tok/s, fast tier verdict
 ```
 
 Optimise the largest share, not the slowest-feeling stage. Anything under 15%
@@ -195,25 +166,29 @@ export BUD_E_PERSONA="Drier than that. Never enthusiastic."
 Wake words are `bud-e`, `buddy` and `jarvis`. Inside 30 seconds of the last
 exchange no wake word is needed.
 
-### Cold start
-
-The Hermes system prompt is ~13k tokens and prefill runs at roughly 400
-words/sec, so the first turn after an LM Studio restart costs about 25
-seconds. `bud-e run` pays that at startup deliberately. Subsequent turns reuse
-the KV cache. If a turn is unexpectedly slow mid-session, the session history
-has grown past the cached prefix; lower `compression.threshold`.
-
 ### Knobs
 
 | var | default | effect |
 | --- | --- | --- |
 | `BUD_E_ASR` | `mlx-whisper` | `parakeet` is faster, English only, weaker on accents |
 | `BUD_E_WHISPER` | `whisper-large-v3-turbo` | swap to `whisper-large-v3-mlx` for accuracy over speed |
-| `BUD_E_SILENCE_MS` | `380` | how long a pause ends your turn; lower feels snappier, cuts you off mid-thought |
+| `BUD_E_SILENCE_MS` | `450` | how long a pause ends your turn; lower feels snappier, cuts you off mid-thought |
 | `BUD_E_BARGE_RMS` | `0.03` | loudness needed to interrupt; raise it if Bud-E interrupts itself |
-| `BUD_E_VOICE` | `Daniel` | any voice from `say -v '?'` |
-| `BUD_E_FAST_MODEL` | `google/gemma-4-e4b` | the conversational tier |
-| `BUD_E_REASONING` | `low` | Hermes `--reasoning`; empty string to omit |
+| `BUD_E_TTS` | `kokoro` | neural local voice via mlx-audio; `say` for the macOS fallback |
+| `BUD_E_KOKORO_VOICE` | `bm_george` | Kokoro voice; `bm_lewis`, `bf_emma`, `af_heart` are others |
+| `BUD_E_KOKORO_SPEED` | `1.05` | speaking pace |
+| `BUD_E_BARGE_RMS_SPEAKING` | `0.08` | loudness to interrupt while Bud-E talks; raise if it cuts itself off |
+| `BUD_E_NAME` | `Aryan` | what it calls you |
+| `BUD_E_VOICE` | `Daniel` | `say` fallback voice, any from `say -v '?'` |
+| `BUD_E_FAST_MODEL` | `gemma-4-E4B-it-MLX-4bit` | the conversational tier |
+| `BUD_E_FAST_TIER` | `1` | `0` sends chat to the 27B too |
+| `BUD_E_MAX_TOKENS` | `512` | agent reply cap, non-thinking |
+| `BUD_E_THINK_MAX_TOKENS` | `4096` | agent cap on thinking turns |
+| `BUD_E_HISTORY` | `12` | turns kept; trimmed in halves to protect the cache |
+| `BUD_E_PRESENCE` | `1.5` | Qwen presence penalty; lower if tool args get mangled |
+| `BUD_E_READ_ROOTS` | `~/Documents:~/Desktop:~/Downloads` | where file tools may read |
+| `BUD_E_SEARXNG` | empty | local SearXNG URL enables `web_search` |
+| `BUD_E_LAT` / `BUD_E_LON` | Bengaluru | weather location |
 | `BUD_E_ADDRESS` | `sir` | how it addresses you |
 | `BUD_E_RATE` | `195` | words per minute |
 
@@ -237,32 +212,35 @@ open-air interruption to be reliable.
 | path | what |
 | --- | --- |
 | `bud_e/config.py` | every tunable; bench and pipeline read the same values |
-| `bud_e/llm.py` | local endpoint client, Hermes wrapper, ESCALATE parsing |
+| `bud_e/llm.py` | local endpoint client and Qwen sampling |
+| `bud_e/agent.py` | the 27B agent loop: streaming, tool calls, thinking |
+| `bud_e/tools.py` | every tool the agent can call |
 | `bud_e/audio.py` | capture, VAD segmentation, TTS |
 | `bud_e/speaker.py` | ECAPA embedding, enrolment, calibration |
 | `bud_e/asr.py` | MLX Whisper on Apple silicon, faster-whisper elsewhere |
 | `bud_e/triggers.py` | phrase table that bypasses every model |
 | `bud_e/router.py` | which tier takes the turn |
+| `bud_e/persona.py` | how Bud-E talks; shared by both tiers, sized to fill oMLX's cache block |
 | `bud_e/fast.py` | the small-model tier, streamed by sentence |
 | `bud_e/ear.py` | the loop, with barge-in and cancellation |
 | `bud_e/profile.py` | per-stage timing and the summary report |
 | `bench/` | cases, runner, comparison report |
 | `requirements*.txt` | base stack, then the audio stack |
 | `results/` | one JSON per benchmarked model |
-| `hermes/` | config fragment and the voice skill |
+| `hermes/` | config and skill for background delegate jobs |
 
 ## Environment
 
 | var | default |
 | --- | --- |
-| `BUD_E_BASE` | `http://localhost:1234/v1` |
-| `BUD_E_MODEL` | `qwen3.8-27b` |
-| `BUD_E_CLOUD` | `0` (local only; `1` enables escalation) |
-| `BUD_E_CLOUD_MODEL` | `claude-sonnet-4-6` |
+| `BUD_E_BASE` | read from `~/.omlx/settings.json` (port 8250 here) |
+| `BUD_E_API_KEY` | read from `~/.omlx/settings.json` |
+| `BUD_E_MODEL` | `Qwen3.8-27B-MLX-4bit` |
 | `BUD_E_HOME` | `~/.bud-e` |
 
 ## Deliberately not enabled
 
-`terminal` is absent from `HERMES_TOOLSETS`. Voice dispatch means no human
-reads the command before it runs. Add shell access on purpose, with the Docker
+No shell tool in the agent, and `terminal` is absent from `HERMES_TOOLSETS`.
+Voice dispatch means no human reads the command before it runs. File tools
+are read-only and fenced to `BUD_E_READ_ROOTS`. Add shell access on purpose, with the Docker
 mount list decided, not because a turn failed and shell would have fixed it.
