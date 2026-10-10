@@ -1,36 +1,39 @@
-"""Which tier handles this turn.
+"""Which tier handles this turn, and whether the 27B should think first.
 
-Principle unchanged from the start: do not ask a model to predict difficulty,
-because judging difficulty is the capability the small model lacks. Hard-route
-the obvious cases on cheap signals, let the fast model handle the rest, and
-escalate on its own refusal rather than on a guess.
+Do not ask a model to predict difficulty: that is the capability the small
+model lacks. Hard-route the obvious cases on cheap signals, let the fast model
+take the rest, and fall through to the agent when it says ROUTE.
 """
 
 import re
 
-# Anything needing tools, memory, files, the web, or the real world.
-NEEDS_TOOLS = re.compile(
-    r"\b(remind(er)?s?|calendar|schedule|meeting|appointment|email|inbox|"
-    r"search|look ?up|google|weather|forecast|news|price|stock|"
-    r"file|files|folder|directory|read|write|save|open|note|notes|"
-    r"remember|memory|recall|earlier|last time|yesterday|tomorrow|"
-    r"repo|commit|branch|pull request|issue|todo|task)\b", re.I)
+from bud_e import config as C
 
-# Anything where a 4B will be confidently wrong.
-NEEDS_DEPTH = re.compile(
-    r"\b(explain|why does|why is|how does|how do i|derive|prove|design|"
-    r"architect|debug|analy[sz]e|compare|trade-?offs?|brainstorm|plan|"
-    r"review|refactor|optimi[sz]e|calculate|estimate)\b", re.I)
+# Needs a tool. Kept to words that almost always mean one; the fast model's
+# ROUTE catches the rest, so this does not need to be exhaustive.
+NEEDS_TOOLS = re.compile(
+    r"\b(remind(er)?s?|calendar|schedule|meeting|appointment|agenda|"
+    r"weather|forecast|rain|search|look ?up|google|news|"
+    r"files?|folder|notes?|remember|recall|last time|"
+    r"morning brief|my day|todo|to-do)\b", re.I)
+
+# Worth thinking tokens: the user waits a few seconds on purpose.
+NEEDS_THINK = re.compile(
+    r"\b(derive|prove|proof|design|architect|debug|analy[sz]e|"
+    r"trade-?offs?|brainstorm|plan out|calculate|estimate|step by step|"
+    r"think (it )?through|work out)\b", re.I)
 
 LONG_TURN_WORDS = 28
 
 
-def needs_hermes(text: str) -> str | None:
-    """Return a reason to skip the fast tier, or None to try it first."""
+def route(text: str) -> tuple[str, bool, str]:
+    """Returns (tier, think, reason). tier is 'fast' or 'agent'."""
+    if NEEDS_THINK.search(text):
+        return "agent", True, "needs thought"
     if NEEDS_TOOLS.search(text):
-        return "needs tools"
-    if NEEDS_DEPTH.search(text):
-        return "needs depth"
+        return "agent", False, "needs tools"
     if len(text.split()) > LONG_TURN_WORDS:
-        return "long request"
-    return None
+        return "agent", False, "long request"
+    if not C.FAST_TIER:
+        return "agent", False, "fast tier off"
+    return "fast", False, ""

@@ -1,8 +1,8 @@
 """Phrases you say often should not cost a model round trip.
 
-A regex hit returns in milliseconds. The fast tier costs about a second. A
-Hermes turn costs three to five. Anything you say daily with a predictable
-shape belongs here.
+A regex hit returns in milliseconds. A model turn costs a second or more.
+Anything you say daily with a predictable shape and no judgement belongs here.
+Anything that needs parsing (reminders, briefs) goes to the agent instead.
 
 Return a string to speak, or "" to say nothing.
 """
@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from bud_e import config as C
-from bud_e.llm import hermes
+from bud_e.tools import weather_summary
 
 
 @dataclass
@@ -49,7 +49,7 @@ TRIGGERS: list[Trigger] = [
     # --- silence and control -------------------------------------------
     Trigger(re.compile(r"^\s*(stop|quiet|shut up|never ?mind|forget it)\b", re.I),
             lambda m: ""),
-    Trigger(re.compile(r"\b(thanks|thank you|cheers|nice one)\b", re.I),
+    Trigger(re.compile(r"^\s*(thanks|thank you|cheers|nice one)( bud-?e| buddy)?[.!]?\s*$", re.I),
             lambda m: ""),
     Trigger(re.compile(r"\b(volume|louder|quieter) ?(up|down)?\b|"
                        r"\b(turn it (up|down))\b", re.I), _volume),
@@ -62,17 +62,8 @@ TRIGGERS: list[Trigger] = [
     Trigger(re.compile(r"\bwhat('s| is) (the date|today)\b|"
                        r"\bwhat day is it\b", re.I), _date),
 
-    # --- one-shot agent tasks, phrased so Hermes needs no clarification --
-    Trigger(re.compile(r"\bremind me to (?P<what>.+)$", re.I),
-            lambda m: hermes(f"Create a reminder: {m.group('what')}. "
-                             f"Confirm in one short sentence.")),
-    Trigger(re.compile(r"\b(morning brief|what'?s on today|"
-                       r"what does my day look like)\b", re.I),
-            lambda m: hermes("Give me my morning brief: today's calendar and "
-                             "anything due. Three sentences maximum.")),
-    Trigger(re.compile(r"\bweather\b", re.I),
-            lambda m: hermes("Current weather in Bengaluru. One sentence: "
-                             "temperature, sky, and rain chance only.")),
+    Trigger(re.compile(r"^\s*(what'?s|how'?s) the weather( like)?( today| now)?\??\s*$",
+                       re.I), lambda m: weather_summary()),
 ]
 
 
