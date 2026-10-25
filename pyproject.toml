@@ -19,6 +19,9 @@ voice = [
     "mlx-whisper>=0.4; sys_platform == 'darwin'",
     "faster-whisper>=1.1; sys_platform != 'darwin'",
     "kokoro>=0.9",
+    # preshed 3.0.14 breaks loading spaCy's English model, which Kokoro
+    # needs ("OverflowError: Python int too large"). Lift once fixed.
+    "preshed<3.0.14",
     # Kokoro's text front end downloads a spaCy model with pip on first run,
     # and uv-made venvs don't include pip.
     "pip",
