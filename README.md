@@ -342,3 +342,7 @@ macOS `say` voice. On Linux it prints replies instead of speaking.
 
 Everything Bud-E saves lives in `~/.bud-e/` (or `$BUD_E_HOME`): config,
 memory, notes, vocabulary, voiceprint, turn log and bench results.
+
+## License
+
+Apache 2.0. See [LICENSE](LICENSE).
