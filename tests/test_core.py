@@ -201,3 +201,10 @@ def test_example_config_parses():
     p = Path(__file__).parents[1] / "bud_e" / "config.example.toml"
     c = config.load(p)
     assert c.llm.extra_body == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def test_p90_is_never_below_median():
+    from bud_e.turnlog import p90
+    assert p90([5.7, 9.1]) == 9.1
+    assert p90([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) == 9
+    assert p90([3.0]) == 3.0

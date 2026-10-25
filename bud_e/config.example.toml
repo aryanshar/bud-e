@@ -18,6 +18,10 @@ api_key = ""
 temperature = 0.7
 top_p = 0.8
 max_tokens = 400
+# oMLX + hybrid Qwen models (3.5 and later) only cache prompts in 2048-token
+# blocks, so a shorter prompt is re-read in full every turn (~4 s on a dense
+# 27B). 2100 pads the prompt past one block. Leave 0 on other servers.
+min_prompt_tokens = 0
 # Sent with every request. This turns off Qwen-style "thinking", which on a
 # voice assistant is just silence. Set to {} if your server rejects it.
 extra_body = { chat_template_kwargs = { enable_thinking = false } }

@@ -34,6 +34,11 @@ class LLM:
     top_p: float = 0.8
     max_tokens: int = 400
     timeout: float = 120.0
+    # oMLX caches prompts of hybrid models (Qwen3.5+, Gated DeltaNet) in
+    # 2048-token blocks and skips anything shorter, so a short prompt is
+    # re-read in full every turn. Set to ~2100 there to pad past one block.
+    # Other servers don't need it: leave 0.
+    min_prompt_tokens: int = 0
     # Sent with every request. The default turns off Qwen-style thinking,
     # which on a voice path is just silence. Servers that don't know the
     # field ignore it; if yours rejects it, set extra_body = {}.
@@ -76,6 +81,8 @@ class Voice:
     max_speech_s: float = 20.0
     barge_rms: float = 0.03            # loudness that counts as you talking
     barge_rms_speaking: float = 0.08   # same, while it is talking (echo)
+    echo_tail_ms: int = 300            # mic ignored this long after it speaks
+    speaker_check_min_s: float = 1.0   # shorter clips skip the voice check
     speaker_check: str = "auto"        # auto (on once enrolled) | on | off
     input_device: str = ""             # name or index; empty = default
     output_device: str = ""

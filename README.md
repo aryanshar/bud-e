@@ -75,7 +75,10 @@ of your model, then go to Developer → Start Server. URL:
 **oMLX** (menu-bar app with an on-disk prompt cache): add the model in its
 admin panel, pin it so it stays loaded, and turn off thinking in its chat
 template settings. The port is in `~/.omlx/settings.json`. Bud-E reads the
-API key from that file automatically.
+API key from that file automatically. With Qwen 3.5 or later models, also
+set `min_prompt_tokens = 2100` under `[llm]`. oMLX only caches those models'
+prompts in 2,048-token blocks, so without this the prompt is re-read on every
+turn. On a dense 27B that took first-word time from about 4.6 s to 1 s.
 
 **mlx-lm** (no GUI):
 
@@ -223,7 +226,8 @@ low, try a different model rather than a bigger quantisation of the same one.
 uv run bud-e run
 ```
 
-Say **"Bud-E, what's the weather like?"**. For 30 seconds after it answers you
+Say **"Bud-E, what's the weather like?"**. Saying just the wake word gets a
+short chime, and then it's listening. For 30 seconds after it answers you
 don't need the wake word, so you can just carry on talking. The wake words
 are `bud-e`, `buddy` and `jarvis`, and you can change them in the config.
 
@@ -277,7 +281,9 @@ when it starts. Work on whichever stage is biggest.
 
 | Symptom | Fix |
 | --- | --- |
-| Slow to start answering | A smaller or MoE model. Check that your server has prefix caching on (vLLM and llama.cpp do by default) |
+| Slow to start answering | A smaller or MoE model. Check that your server has prefix caching on (vLLM and llama.cpp do by default). On oMLX, see `min_prompt_tokens` in step 2 |
+| Ignores you right after it speaks | Lower `voice.echo_tail_ms` (it ignores the mic this long after speaking, default 300) |
+| Voice check rejects you | Re-run `bud-e calibrate` in the room you use. Clips under `voice.speaker_check_min_s` (1 s) skip the check |
 | Cuts you off mid-thought | Raise `voice.silence_ms` (try 700) |
 | Interrupts itself | Raise `voice.barge_rms_speaking`, or wear headphones |
 | Ignores your interruptions | Lower `voice.barge_rms_speaking` |

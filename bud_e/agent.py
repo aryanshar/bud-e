@@ -13,7 +13,7 @@ from datetime import datetime
 
 from bud_e.config import Config
 from bud_e.llm import LLM
-from bud_e.prompt import system_prompt
+from bud_e.prompt import padding, system_prompt
 from bud_e.text import Sentences, ThinkFilter
 from bud_e.tools import Toolbox, memory_snapshot
 
@@ -41,11 +41,26 @@ class Agent:
     def messages(self, current: list[dict]) -> list[dict]:
         return [self.system, *(m for t in self.turns for m in t), *current]
 
-    def warm(self) -> None:
+    def warm(self) -> int:
         """Prefill the system prompt and tool schemas so the first real turn
-        hits the server's prefix cache."""
-        list(self.llm.stream([self.system, {"role": "user", "content": "hi"}],
-                             self.tools.schemas(), max_tokens=1))
+        hits the server's prefix cache. Pads the prompt first if
+        llm.min_prompt_tokens asks for it. Returns the prompt's token count
+        (0 if the server doesn't report it)."""
+        n = self._prefill()
+        target = self.cfg.llm.min_prompt_tokens
+        if target and 0 < n < target:
+            self.system["content"] += "\n\n" + padding(target - n + 40)
+            n = self._prefill()
+            # oMLX stores the block on one pass and serves it from the next,
+            # so prime it once more or the first real turn is slow.
+            self._prefill()
+        return n
+
+    def _prefill(self) -> int:
+        r = self.llm._create(
+            messages=[self.system, {"role": "user", "content": "hi"}],
+            tools=self.tools.schemas() or None, max_tokens=1)
+        return getattr(r.usage, "prompt_tokens", 0) if r.usage else 0
 
     def turn(self, text: str, cancel: threading.Event | None = None
              ) -> Iterator[tuple[str, str]]:

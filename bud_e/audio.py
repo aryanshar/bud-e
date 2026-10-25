@@ -35,12 +35,20 @@ class Microphone:
         sd.wait()
         return buf.reshape(-1)
 
-    def utterances(self, on_onset: Callable[[float], None] | None = None
+    def utterances(self, on_onset: Callable[[float], None] | None = None,
+                   is_speaking: Callable[[], bool] = lambda: False,
+                   on_barge: Callable[[float], None] | None = None,
                    ) -> Iterator[np.ndarray]:
         """Yields one float32 array per thing said. Never stops listening.
 
+        While is_speaking() is true the mic hears our own voice, so input is
+        thrown away, and for echo_tail_ms after, unless it stays loud for
+        ~100 ms (you talking over it). Then on_barge(loudness) fires and
+        recording resumes. Without this, your reply right after it speaks
+        gets glued onto its own echo.
+
         on_onset(loudness) fires the moment speech starts, long before the
-        utterance ends. That is what lets you interrupt mid-sentence."""
+        utterance ends, so a turn still thinking can be cancelled."""
         import sounddevice as sd
         import torch
         from silero_vad import VADIterator, load_silero_vad
@@ -48,18 +56,40 @@ class Microphone:
         vad = VADIterator(load_silero_vad(), sampling_rate=SR,
                           threshold=self.v.vad_threshold,
                           min_silence_duration_ms=self.v.silence_ms)
-        lead = 4                       # frames kept from just before onset
+        lead = 8                       # frames (~250 ms) kept before onset
+        barge_frames = 3               # ~100 ms of loud input = interruption
         recent: list[np.ndarray] = []
         buf: list[np.ndarray] = []
         talking = False
+        loud = 0
+        deaf = 0                       # frames still to ignore after speaking
+        tail = int(self.v.echo_tail_ms / 1000 * SR / FRAME)
         with sd.InputStream(samplerate=SR, channels=1, dtype="float32",
                             blocksize=FRAME,
                             device=_device(self.v.input_device)) as stream:
             while True:
                 chunk, _ = stream.read(FRAME)
                 chunk = chunk.reshape(-1)
-                event = vad(torch.from_numpy(chunk)) or {}
                 recent = (recent + [chunk])[-lead:]
+
+                if is_speaking():
+                    level = rms(chunk)
+                    loud = loud + 1 if level >= self.v.barge_rms_speaking else 0
+                    if loud < barge_frames:
+                        deaf = tail
+                        talking, buf = False, []
+                        vad.reset_states()
+                        continue
+                    loud, deaf = 0, 0
+                    if on_barge:
+                        on_barge(level)
+                    vad.reset_states()
+                elif deaf:
+                    deaf -= 1
+                    vad.reset_states()        # room echo after it stops
+                    continue
+
+                event = vad(torch.from_numpy(chunk)) or {}
 
                 if "start" in event and not talking:
                     talking, buf = True, list(recent)
@@ -108,6 +138,17 @@ class Voice:
         audio = self.engine.synth(text)
         if gen == self.gen and not (cancel and cancel.is_set()):
             self._q.put((gen, audio))
+
+    def chime(self) -> None:
+        """A soft two-note blip: "I heard you, go on"."""
+        if self.engine is None:
+            return
+        sr = self.engine.sample_rate
+        notes = []
+        for freq in (880, 1320):
+            t = np.arange(int(0.07 * sr)) / sr
+            notes.append(np.sin(2 * np.pi * freq * t) * np.hanning(len(t)))
+        self._q.put((self.gen, (0.15 * np.concatenate(notes)).astype(np.float32)))
 
     def wait(self, cancel: threading.Event | None = None) -> None:
         while self.speaking and not (cancel and cancel.is_set()):

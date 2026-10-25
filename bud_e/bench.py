@@ -17,6 +17,7 @@ import time
 from bud_e.agent import Agent, stamp
 from bud_e.config import Config
 from bud_e.llm import LLM, parse_args
+from bud_e.turnlog import p90
 
 # (what you'd say, the tool it should call; None = answer without tools)
 CASES = [
@@ -102,7 +103,7 @@ def run(cfg: Config, runs: int = 2) -> dict:
         "n": len(rows), "behaviour": sum(r["ok"] for r in rows) / len(rows),
         "malformed": sum(r["malformed"] for r in rows),
         "latency_median": statistics.median(lat),
-        "latency_p90": sorted(lat)[max(0, int(len(lat) * 0.9) - 1)],
+        "latency_p90": p90(lat),
         "decode_tps": _decode_speed(agent.llm),
     }
     good = (summary["behaviour"] >= 0.85 and summary["malformed"] == 0

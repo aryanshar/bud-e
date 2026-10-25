@@ -4,6 +4,7 @@ slow. Every voice turn appends a line to ~/.bud-e/turns.jsonl."""
 from __future__ import annotations
 
 import json
+import math
 import statistics
 import time
 from contextlib import contextmanager
@@ -45,8 +46,9 @@ class Turn:
             f.write(json.dumps(rec) + "\n")
 
 
-def _p90(v: list[float]) -> float:
-    return sorted(v)[max(0, int(len(v) * 0.9) - 1)]
+def p90(v: list[float]) -> float:
+    """Nearest-rank 90th percentile: the value 90% of turns are at or under."""
+    return sorted(v)[max(0, math.ceil(len(v) * 0.9) - 1)]
 
 
 def stats(cfg: Config) -> None:
@@ -70,6 +72,6 @@ def stats(cfg: Config) -> None:
             v = [r[stage] for r in sub if stage in r]
             if v:
                 print(f"  {kind:<9} {stage:<12} {statistics.median(v):7.2f}s "
-                      f"{_p90(v):7.2f}s  {len(v):3d}")
+                      f"{p90(v):7.2f}s  {len(v):3d}")
     print("\n  first_audio is what a turn feels like: end of your speech to "
           "its first word.\n")

@@ -11,6 +11,7 @@ flag.
 
 from __future__ import annotations
 
+import random
 import re
 import threading
 import time
@@ -26,6 +27,11 @@ from bud_e.commands import instant
 from bud_e.config import Config
 from bud_e.speaker_id import SpeakerGate
 from bud_e.turnlog import Turn
+
+
+LOOKUPS = {"get_weather", "get_calendar", "list_reminders", "web_search",
+           "find_files", "read_file", "read_notes", "recall"}
+FILLERS = ["One sec.", "Let me check.", "Hang on.", "Checking."]
 
 
 def wake_pattern(words: list[str]) -> re.Pattern:
@@ -47,7 +53,6 @@ class Assistant:
         self.worker = ThreadPoolExecutor(max_workers=1)
         self.cancel = threading.Event()      # the newest turn's flag
         self.busy = False
-        self.echo = False                    # last onset was probably our voice
         self.last_exchange = 0.0
 
     # --- main thread ----------------------------------------------------
@@ -56,7 +61,10 @@ class Assistant:
         print(f"\n{self.cfg.assistant.name} is listening. Say "
               f"\"{self.cfg.assistant.wake_words[0]}\" first. Ctrl-C to quit.\n")
         try:
-            for seg in self.mic.utterances(on_onset=self.on_onset):
+            for seg in self.mic.utterances(
+                    on_onset=self.on_onset,
+                    is_speaking=lambda: self.voice.speaking,
+                    on_barge=self.on_barge):
                 self.on_utterance(seg)
         except KeyboardInterrupt:
             print()
@@ -72,27 +80,24 @@ class Assistant:
         print(f"  voice    {type(engine).__name__ if engine else 'off (printing)'}")
         print(f"  speaker  {'on, threshold %.2f' % self.gate.threshold if self.gate else 'off (anyone can talk to it)'}")
         t = time.perf_counter()
-        self.agent.warm()
-        print(f"  prefill  {time.perf_counter() - t:.1f}s")
+        n = self.agent.warm()
+        print(f"  prefill  {time.perf_counter() - t:.1f}s"
+              + (f", prompt {n} tokens" if n else ""))
 
     def on_onset(self, level: float) -> None:
-        v = self.cfg.voice
-        talking = self.voice.speaking
-        if level < (v.barge_rms_speaking if talking else v.barge_rms):
-            # Quiet onset while it's talking is almost always its own voice
-            # coming back through the speakers.
-            self.echo = talking
-            return
-        self.echo = False
-        if talking or self.busy:
-            print(f"  [interrupted, level {level:.3f}]")
+        """You started talking while it was quiet. If a turn is still
+        thinking, a new request replaces it."""
+        if self.busy and level >= self.cfg.voice.barge_rms:
+            print(f"  [interrupted while thinking, level {level:.3f}]")
+            self.cancel.set()
+
+    def on_barge(self, level: float) -> None:
+        """You talked over it, loud enough to beat its own echo."""
+        print(f"  [interrupted, level {level:.3f}]")
         self.cancel.set()
         self.voice.stop()
 
     def on_utterance(self, seg: np.ndarray) -> None:
-        if self.echo:
-            print("  [ignored: own voice]")
-            return
         self.cancel = threading.Event()
         self.worker.submit(self._safe_turn, seg, self.cancel)
 
@@ -108,11 +113,15 @@ class Assistant:
 
     def handle(self, seg: np.ndarray, cancel: threading.Event) -> None:
         turn = Turn()
-        if self.gate:
+        seconds = len(seg) / 16_000
+        # Voice checks on very short clips are close to a coin flip, so a
+        # bare "buddy" goes through; the request that follows gets checked.
+        if self.gate and seconds >= self.cfg.voice.speaker_check_min_s:
             with turn.stage("speaker"):
                 score = self.gate.score(seg)
             if score < self.gate.threshold:
-                print(f"  [ignored: speaker score {score:.2f}]")
+                print(f"  [ignored: speaker score {score:.2f} < "
+                      f"{self.gate.threshold:.2f}, {seconds:.1f}s clip]")
                 return
 
         with turn.stage("asr"):
@@ -127,7 +136,11 @@ class Assistant:
             return
         query = self.wake.sub("", text).strip(" ,.!?")
         if not query:
-            self._say_all(["Yes?"], cancel)
+            # Just the wake word: chime instead of talking over what you
+            # say next.
+            self.voice.chime()
+            self.last_exchange = time.time()
+            print("  [listening]")
             return
 
         reply = instant(query)
@@ -143,13 +156,19 @@ class Assistant:
             print(turn.line() + "\n")
 
     def _agent_sentences(self, query, cancel, turn):
-        tools = []
+        tools, spoke = [], False
         for kind, value in self.agent.turn(query, cancel):
             if kind == TOOL:
                 print(f"  [tool {value}]")
                 tools.append(value)
                 turn.meta["tools"] = tools
+                # A lookup means a second model call before the answer, so
+                # say something now, like a person would before checking.
+                if not spoke and value in LOOKUPS:
+                    spoke = True
+                    yield random.choice(FILLERS)
             elif kind == SAY:
+                spoke = True
                 yield value
 
     def _say_all(self, sentences, cancel, turn: Turn | None = None) -> None:
