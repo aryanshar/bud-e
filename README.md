@@ -1,246 +1,344 @@
-# bud-e
+# Bud-E
 
-Local-first voice agent. A benchmark harness that decides which model earns the
-job, and the pipeline that runs it.
+A voice assistant that runs entirely on your own machine. You talk, it
+answers out loud, and it can check your calendar, set reminders, remember
+things about you, read your files and look up the weather. No cloud and no
+API keys: speech recognition, the language model and the voice all run
+locally.
+
+It runs on an Apple silicon Mac or on a Linux box with an NVIDIA GPU. You
+can also split it: the model on a GPU machine, the microphone on your
+laptop.
 
 ```
-mic → Silero VAD → ECAPA speaker check → Whisper
-                        ↓ (not you)          ↓
-                     discarded            router
-                                             │
-        ┌──────────────────────┬─────────────┴────────────────────┐
-        ↓                      ↓                                  ↓
-  tier 0: triggers     tier 1: Gemma 4 E4B (optional)   tier 2: Qwen 27B agent
-  regex, no model      no tools, streamed               direct to oMLX, streamed,
-  ~10ms                ~0.5s to first word              native tool calls,
-                            │ ROUTE ───────────────────→  thinking on demand
-                                                         ~0.5–1s to first word
-                                                                  │ delegate
-                                                                  ↓
-                                                      Hermes, background only
+ mic ─▶ voice detection ─▶ (is it you?) ─▶ Whisper ─▶ wake word?
+        Silero VAD          optional         speech       │
+                                             to text      ▼
+                                              instant answer (stop, time, date)
+                                                          │ otherwise
+                                                          ▼
+        speaker ◀── Kokoro voice ◀── sentences ◀── local LLM ⇄ tools
+                    (sentence 1 plays while 2 is being generated)
 ```
 
-Every model tier streams sentence by sentence, so speech starts at the first
-full stop. The mic runs on its own thread, so speaking over Bud-E stops it
-mid-sentence and cancels generation.
+**How it works**
 
-## Tiers
+- **One model does everything.** Bud-E talks to a model server you run
+  yourself (Ollama, LM Studio, oMLX, llama.cpp, vLLM and others) over the
+  standard OpenAI chat API. The model chats, decides when to use a tool, and
+  answers. There's no router and no second model.
+- **It streams.** Speech starts at the first full stop, not when the whole
+  reply is done.
+- **You can interrupt it.** Start talking and it stops mid-sentence and drops
+  what it was generating.
+- **The prompt stays fixed.** The system prompt doesn't change between turns,
+  so the server can reuse its cache and only processes your new words. The
+  current time goes in front of each of your messages instead.
 
-| tier | model | prompt | when |
-| --- | --- | --- | --- |
-| triggers | none | none | time, date, volume, weather one-liner, thanks, stop |
-| fast | `gemma-4-E4B-it-MLX-4bit` | ~200 tok | chat; off with `BUD_E_FAST_TIER=0` |
-| agent | `Qwen3.8-27B-MLX-4bit` | ~1.5k tok, frozen | tools, memory, depth |
-| delegate | Hermes + the same 27B | ~13k tok | long jobs, answered later |
+---
 
-`bud_e/router.py` sends tool words and long turns to the agent, and depth
-words (prove, design, debug, plan out) to the agent with thinking on.
-Everything else tries the fast tier, which emits `ROUTE` when it cannot cope.
+## 1. Pick a model for your hardware
 
-The agent's system prompt never changes; the date and time ride at the front
-of each user message. That keeps the server's prefix cache hitting on every
-turn, which is most of the latency win over the old Hermes path.
+The model needs memory (Mac unified memory, or GPU VRAM on Linux). Leave
+about 3 GB free for Whisper and the voice.
 
-### Agent tools
+| Memory | What to run | Notes |
+| --- | --- | --- |
+| 16 GB | a 4–8B model at 4-bit, e.g. *Qwen3-4B-Instruct-2507*, *Qwen3-8B* | Quick, but makes more tool-call mistakes |
+| 24–36 GB | a ~30B mixture-of-experts model with ~3B active, at 4-bit, e.g. *Qwen3-30B-A3B-Instruct-2507* | **Best default.** Quality close to a 30B model at the speed of a 3B one |
+| 48 GB+ | the same MoE at 8-bit, or a dense 27–32B at 4-bit | Dense models are noticeably slower to start talking |
 
-`remember`, `recall` (`~/.bud-e/memory.md`), `add_note`, `read_notes`,
-`find_files`, `read_file` (read-only, inside `BUD_E_READ_ROOTS`),
-`get_calendar` (icalBuddy, AppleScript fallback), `set_reminder`,
-`list_reminders` (Reminders.app), `get_weather` (Open-Meteo, no key),
-`web_search` (only if `BUD_E_SEARXNG` points at a local SearXNG), and
-`delegate` (only if `hermes` is on PATH).
+The names above are examples; newer releases in the same size class should
+work too. Things to look for:
 
-Test them in text before using the mic:
+- **Good tool calling.** This matters more than anything else. Run
+  `bud-e bench` (step 6) and keep the model if it scores 85% or more.
+- **An "instruct" model, not a "thinking" one.** Thinking models stay silent
+  while they reason. Bud-E asks Qwen-style models to skip thinking, and hides
+  any `<think>` text that comes through, but the time spent thinking still
+  delays the reply.
+- **MoE over dense if you're unsure.** Speed to first word is what makes a
+  voice assistant feel good.
+
+## 2. Run a model server
+
+Pick one. Bud-E only needs the server's URL and the model name.
+
+### macOS (Apple silicon)
+
+MLX-based servers are the fastest on a Mac.
+
+**LM Studio** (GUI, easiest): install from lmstudio.ai, download an MLX build
+of your model, then go to Developer → Start Server. URL:
+`http://localhost:1234/v1`.
+
+**oMLX** (menu-bar app with an on-disk prompt cache): add the model in its
+admin panel, pin it so it stays loaded, and turn off thinking in its chat
+template settings. The port is in `~/.omlx/settings.json`. Bud-E reads the
+API key from that file automatically.
+
+**mlx-lm** (no GUI):
 
 ```bash
-python -m bud_e.cli chat            # add --think for depth mode
+uv tool install mlx-lm
+mlx_lm.server --model mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit --port 8080
+# URL: http://localhost:8080/v1
 ```
 
-## Setup
-
-Uses your own virtual environment. uv is the installer, nothing more.
+**Ollama** (simplest to install, slower on a Mac than MLX):
 
 ```bash
-source ~/jarvis/bin/activate          # or wherever your venv lives
-uv pip install -r requirements.txt    # bench only, ~20MB
+brew install ollama && ollama serve        # leave this running
+ollama pull qwen3:8b                       # or a bigger model that fits
+# URL: http://localhost:11434/v1
 ```
 
-Run everything as modules from the repo root. There is no package to install.
+Optional: macOS limits how much memory the GPU can use to about 75% of RAM.
+To raise it until the next reboot (for example 40 GB on a 48 GB Mac):
+`sudo sysctl iogpu.wired_limit_mb=40960`.
+
+### Linux with an NVIDIA GPU
+
+Check the driver first: `nvidia-smi` should list your GPU.
+
+**vLLM** (fastest when the model fits in VRAM):
 
 ```bash
-python -m bench.cli --help
-python -m bud_e.cli --help
+uv tool install vllm
+vllm serve Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
+  --max-model-len 32768 \
+  --enable-auto-tool-choice --tool-call-parser hermes \
+  --port 8000
+# URL: http://localhost:8000/v1
 ```
 
-Optional shell aliases:
+The two `--...tool...` flags are required, or tool calls come back as plain
+text. FP8 needs an RTX 40-series or newer card. On a 3090 or older, use an
+AWQ or GPTQ 4-bit build of the model.
+
+**llama.cpp** (best when the model is a little too big for VRAM, since it can
+keep some layers in system RAM):
 
 ```bash
-alias bud-bench='python -m bench.cli'
-alias bud-e='python -m bud_e.cli'
+llama-server -hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M \
+  --jinja -ngl 99 -c 32768 --port 8080
+# URL: http://localhost:8080/v1
 ```
 
-## 1. Benchmark
+`--jinja` turns on tool calling. On a 12–16 GB card, add `--n-cpu-moe 20`
+(tune the number) to keep part of the model in RAM.
 
-Serve the model from oMLX (SETUP.md step 2), then:
+**Ollama**: `curl -fsSL https://ollama.com/install.sh | sh`, then
+`ollama pull <model>`. URL: `http://localhost:11434/v1`.
+
+### Split setup: model on one machine, mic on another
+
+Run the server on the GPU machine, listening on the network (vLLM
+`--host 0.0.0.0`, llama.cpp `--host 0.0.0.0`, Ollama `OLLAMA_HOST=0.0.0.0`),
+and set `base_url = "http://<gpu-box-ip>:<port>/v1"` on the laptop. Only
+text goes over the network; your audio stays on the laptop.
+
+## 3. Install Bud-E
+
+You need Python 3.12 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-python -m bench.cli models                      # what the endpoint has loaded
-python -m bench.cli run --model qwen3.8-27b --runs 3
-python -m bench.cli run --model qwen3.8-27b-abliterated --runs 3
-python -m bench.cli report
+git clone git@github.com:aryanshar/bud-e.git && cd bud-e
+# or: git clone https://github.com/aryanshar/bud-e.git
+uv sync --extra voice                    # add --extra speaker for the voice check
 ```
 
-Ten cases cover tool selection and plain answers, using the agent's real
-system prompt and tool schemas.
-Targets: median TTFT under 1.00s, mean throughput above 20 tok/s, behaviour at
-85% or better, zero malformed tool arguments.
+**macOS** needs nothing else. The first time you run it, macOS asks to let
+your terminal use the microphone, and later Calendar and Reminders. For
+calendar events that repeat, also run `brew install ical-buddy`.
 
-Behaviour is the number that decides. Below 85% no amount of prompt work in
-Hermes will save it, and the answer is a different model rather than a bigger
-quant. Re-run after any change to quant, context length, or KV cache type;
-those settings interact in ways that are not obvious.
+**Linux** needs a couple of system packages:
 
 ```bash
-export BUD_E_MODEL=Qwen3.8-27B-MLX-4bit     # the winner
+sudo apt install libportaudio2 espeak-ng   # audio I/O, and a fallback for Kokoro
 ```
 
-### Thinking
+Whisper uses the GPU on its own if CUDA works. If it fails with a missing
+`libcudnn` or `libcublas`, see Troubleshooting.
 
-Qwen thinks by default, and on a voice path that is silence. Every request
-sends `chat_template_kwargs.enable_thinking=false` except turns the router
-marks as depth. The bench `thinking` line should read 0; `bud-e doctor`
-checks it too. If it does not, oMLX is not passing the kwarg through: set it
-in the model's chat template kwargs in the admin panel.
+Run everything through `uv run bud-e ...`, or activate the venv with
+`source .venv/bin/activate` and use `bud-e ...` directly.
 
-## 3. Voice
+## 4. Configure
 
 ```bash
-uv pip install -r requirements-voice.txt
-python -m bud_e.cli enrol         # six clips, builds your voiceprint
-python -m bud_e.cli calibrate     # you vs others, writes the threshold
-python -m bud_e.cli run
+uv run bud-e init          # writes ~/.bud-e/config.toml
 ```
 
-Enrol and calibrate in the room and on the mic you will actually use. If
-calibrate reports overlapping distributions, re-enrol with longer clips rather
-than lowering the threshold by hand.
+Open the file and set at least:
 
-### First test, in this order
+```toml
+[llm]
+base_url = "http://localhost:1234/v1"   # your server from step 2
+model    = "qwen3-30b-a3b-instruct-2507" # as the server names it
 
-1. "Bud-E, what day is it."
-2. Within thirty seconds, without the wake phrase: "and what about tomorrow."
-3. Have someone else, or a video, say "Bud-E, what day is it."
+[user]
+name      = "Sam"
+location  = "Bengaluru"
+latitude  = 12.9716                      # these two turn on weather
+longitude = 77.5946
+```
 
-One and two exercise the speaker gate, wake phrase, follow-up window, and
-session continuity. Three should print `[ignored, speaker score 0.xx]` and stay
-silent.
+The commented example
+[bud_e/config.example.toml](bud_e/config.example.toml) lists every setting.
+To try another server or model for one run without editing the file, set
+`BUD_E_BASE_URL` / `BUD_E_MODEL`.
 
-Expect under a second to the first word on chat and simple tool turns once
-the prefix cache is warm, and a few seconds on thinking turns (Bud-E says
-"give me a moment" first). `bud-e latency` tells you whether the cache is
-hitting and whether the fast tier is worth its memory.
+## 5. Check it, then try it in text
 
-Speaker verification is a filter, not a lock. It keeps a housemate or the
-television out. It does not survive a recording of you played at the mic, so
-nothing destructive should sit behind it alone.
+```bash
+uv run bud-e doctor        # server, model, tool calls, audio devices
+uv run bud-e chat          # type to it: no mic needed
+```
+
+`doctor` sends one real request and confirms the model makes tool calls. In
+`chat`, try "what's on tomorrow", "remind me to call the plumber Tuesday at
+four", "will it rain today", or "I take my coffee black" and later "how do I
+take my coffee". Fix anything that's off here, before adding audio to the
+mix.
+
+## 6. Benchmark the model (worth doing once)
+
+```bash
+uv run bud-e bench         # about a minute
+uv run bud-e bench --report  # compare every model you've tried
+```
+
+This runs ten realistic requests with the real prompt and tools. Keep a
+model that picks the right tool 85% or more of the time, never writes broken
+tool arguments, and starts answering in under about 1.5 s. If it scores
+low, try a different model rather than a bigger quantisation of the same one.
+
+## 7. Talk to it
+
+```bash
+uv run bud-e run
+```
+
+Say **"Bud-E, what's the weather like?"**. For 30 seconds after it answers you
+don't need the wake word, so you can just carry on talking. The wake words
+are `bud-e`, `buddy` and `jarvis`, and you can change them in the config.
+
+Use **headphones** if you can. Without them the mic hears the speakers.
+Bud-E ignores quiet sounds while it's talking, but headphones remove the
+problem completely.
+
+### Only answer your voice (optional)
+
+```bash
+uv sync --extra voice --extra speaker
+uv run bud-e enrol         # six short clips of you
+uv run bud-e calibrate     # you vs. someone else (a podcast works)
+```
+
+Once you've enrolled, it's on automatically. Do both steps in the room and on
+the mic you normally use. This keeps a housemate or the TV out. It is not
+security: a recording of your voice gets through.
+
+---
+
+## Tools
+
+| Tool | What it does | Where |
+| --- | --- | --- |
+| `remember`, `recall` | Long-term memory in `~/.bud-e/memory.md`. Recent entries are also added to the prompt | everywhere |
+| `add_note`, `read_notes` | `~/.bud-e/notes.md` | everywhere |
+| `find_files`, `read_file` | Read-only, only inside `read_roots` | everywhere |
+| `get_weather` | Open-Meteo, no key needed | when latitude/longitude are set |
+| `web_search` | Your own SearXNG instance | when `searxng_url` is set |
+| `set_volume` | System volume | macOS; Linux with `pactl` |
+| `get_calendar`, `set_reminder`, `list_reminders` | Calendar.app and Reminders.app | macOS |
+
+There's no shell tool on purpose. With voice, nobody reads a command before
+it runs.
+
+To add a tool, write a function in [bud_e/tools.py](bud_e/tools.py) with the
+`@tool(...)` decorator. It takes the config plus its arguments and returns a
+short string. `available=` controls which machines it's offered on.
 
 ## Tuning
 
-Every turn logs its stage timings to `~/.bud-e/turns.jsonl`.
+Every voice turn is timed and logged to `~/.bud-e/turns.jsonl`:
 
 ```bash
-python -m bud_e.cli profile     # median, p90 and share per stage
-python -m bud_e.cli latency     # cold vs warm TTFT, decode tok/s, fast tier verdict
+uv run bud-e stats
 ```
 
-Optimise the largest share, not the slowest-feeling stage. Anything under 15%
-is not worth touching.
+`first_audio` is the number to watch: the time from when you stop talking to
+when it starts. Work on whichever stage is biggest.
 
-### Persona
+| Symptom | Fix |
+| --- | --- |
+| Slow to start answering | A smaller or MoE model. Check that your server has prefix caching on (vLLM and llama.cpp do by default) |
+| Cuts you off mid-thought | Raise `voice.silence_ms` (try 700) |
+| Interrupts itself | Raise `voice.barge_rms_speaking`, or wear headphones |
+| Ignores your interruptions | Lower `voice.barge_rms_speaking` |
+| Gets names and jargon wrong | Add them to `~/.bud-e/vocab.txt` (it's fed to Whisper) |
+| Whisper slow on a CPU-only machine | `voice.whisper_model = "small.en"` |
+| Voice sounds wrong | `voice.kokoro_voice`: `af_heart`, `bf_emma`, `bm_lewis`, `am_michael`... |
+
+## Troubleshooting
+
+**`doctor` says the server isn't reachable.** Start the server (step 2) and
+check that the port in `base_url` matches it. `curl <base_url>/models` should
+return JSON.
+
+**Tool calls show up as text, or never happen.** The server isn't parsing
+tool calls. On vLLM add `--enable-auto-tool-choice --tool-call-parser hermes`.
+On llama.cpp add `--jinja`. In LM Studio, use a model it marks as
+supporting tools. If that's all set and the bench score is still low, try a
+different model.
+
+**The server rejects requests (400 errors).** Bud-E retries once without
+`extra_body` and prints a note when it does. To stop sending it at all, set
+`extra_body = {}` under `[llm]`.
+
+**It answers after a long silence.** It's probably a thinking model. Use the
+instruct version, or turn thinking off in the server.
+
+**No sound in, or silence recorded (macOS).** Allow your terminal under System
+Settings → Privacy & Security → Microphone, then restart the terminal. When
+access is denied, macOS gives the app silence rather than an error.
+
+**Wrong mic or speaker.** Run `python -m sounddevice` to list devices, then set
+`voice.input_device` / `voice.output_device` to a name or number.
+
+**Linux: `libcudnn` or `libcublas` not found (Whisper).** Point faster-whisper
+at the CUDA libraries that came with PyTorch:
 
 ```bash
-export BUD_E_ADDRESS=sir
-export BUD_E_PERSONA="Drier than that. Never enthusiastic."
+export LD_LIBRARY_PATH=$(uv run python -c 'import os, nvidia.cublas.lib, nvidia.cudnn.lib; print(os.path.dirname(nvidia.cublas.lib.__file__) + ":" + os.path.dirname(nvidia.cudnn.lib.__file__))')
 ```
 
-Wake words are `bud-e`, `buddy` and `jarvis`. Inside 30 seconds of the last
-exchange no wake word is needed.
+**Kokoro fails on first run.** It downloads a small English language model
+the first time. That needs internet once, and `pip` in the venv (the voice
+extra installs it). If Kokoro still won't load, Bud-E falls back to the
+macOS `say` voice. On Linux it prints replies instead of speaking.
 
-### Knobs
+## Project layout
 
-| var | default | effect |
-| --- | --- | --- |
-| `BUD_E_ASR` | `mlx-whisper` | `parakeet` is faster, English only, weaker on accents |
-| `BUD_E_WHISPER` | `whisper-large-v3-turbo` | swap to `whisper-large-v3-mlx` for accuracy over speed |
-| `BUD_E_SILENCE_MS` | `450` | how long a pause ends your turn; lower feels snappier, cuts you off mid-thought |
-| `BUD_E_BARGE_RMS` | `0.03` | loudness needed to interrupt; raise it if Bud-E interrupts itself |
-| `BUD_E_TTS` | `kokoro` | neural local voice via mlx-audio; `say` for the macOS fallback |
-| `BUD_E_KOKORO_VOICE` | `bm_george` | Kokoro voice; `bm_lewis`, `bf_emma`, `af_heart` are others |
-| `BUD_E_KOKORO_SPEED` | `1.05` | speaking pace |
-| `BUD_E_BARGE_RMS_SPEAKING` | `0.08` | loudness to interrupt while Bud-E talks; raise if it cuts itself off |
-| `BUD_E_NAME` | `Aryan` | what it calls you |
-| `BUD_E_VOICE` | `Daniel` | `say` fallback voice, any from `say -v '?'` |
-| `BUD_E_FAST_MODEL` | `gemma-4-E4B-it-MLX-4bit` | the conversational tier |
-| `BUD_E_FAST_TIER` | `1` | `0` sends chat to the 27B too |
-| `BUD_E_MAX_TOKENS` | `512` | agent reply cap, non-thinking |
-| `BUD_E_THINK_MAX_TOKENS` | `4096` | agent cap on thinking turns |
-| `BUD_E_HISTORY` | `12` | turns kept; trimmed in halves to protect the cache |
-| `BUD_E_PRESENCE` | `1.5` | Qwen presence penalty; lower if tool args get mangled |
-| `BUD_E_READ_ROOTS` | `~/Documents:~/Desktop:~/Downloads` | where file tools may read |
-| `BUD_E_SEARXNG` | empty | local SearXNG URL enables `web_search` |
-| `BUD_E_LAT` / `BUD_E_LON` | Bengaluru | weather location |
-| `BUD_E_ADDRESS` | `sir` | how it addresses you |
-| `BUD_E_RATE` | `195` | words per minute |
-
-### Accents and proper nouns
-
-`~/.bud-e/vocab.txt` is fed to Whisper as an initial prompt on every
-transcription. Adding the words you actually say — names, tools, jargon — fixes
-more recognition errors than changing model does. Edit it and restart.
-
-### Barge-in
-
-Bud-E stops talking the moment you start. Speech onset triggers it, not a
-finished sentence, so it feels immediate. Without headphones the mic hears the
-laptop speakers, so there is a loudness gate: raise `BUD_E_BARGE_RMS` if it
-interrupts itself, lower it if it ignores you. Headphones remove the problem
-entirely, and proper echo cancellation is the only real fix if you want
-open-air interruption to be reliable.
-
-## Layout
-
-| path | what |
+| File | What's in it |
 | --- | --- |
-| `bud_e/config.py` | every tunable; bench and pipeline read the same values |
-| `bud_e/llm.py` | local endpoint client and Qwen sampling |
-| `bud_e/agent.py` | the 27B agent loop: streaming, tool calls, thinking |
-| `bud_e/tools.py` | every tool the agent can call |
-| `bud_e/audio.py` | capture, VAD segmentation, TTS |
-| `bud_e/speaker.py` | ECAPA embedding, enrolment, calibration |
-| `bud_e/asr.py` | MLX Whisper on Apple silicon, faster-whisper elsewhere |
-| `bud_e/triggers.py` | phrase table that bypasses every model |
-| `bud_e/router.py` | which tier takes the turn |
-| `bud_e/persona.py` | how Bud-E talks; shared by both tiers, sized to fill oMLX's cache block |
-| `bud_e/fast.py` | the small-model tier, streamed by sentence |
-| `bud_e/ear.py` | the loop, with barge-in and cancellation |
-| `bud_e/profile.py` | per-stage timing and the summary report |
-| `bench/` | cases, runner, comparison report |
-| `requirements*.txt` | base stack, then the audio stack |
-| `results/` | one JSON per benchmarked model |
-| `hermes/` | config and skill for background delegate jobs |
+| [bud_e/config.py](bud_e/config.py) | Every setting, with defaults. Loads `~/.bud-e/config.toml` |
+| [bud_e/llm.py](bud_e/llm.py) | The OpenAI-compatible client: streaming, tool-call assembly |
+| [bud_e/agent.py](bud_e/agent.py) | The conversation loop: stream, run tools, repeat; history |
+| [bud_e/prompt.py](bud_e/prompt.py) | Personality and tool rules. Built once per session |
+| [bud_e/tools.py](bud_e/tools.py) | Every tool, and which machines it runs on |
+| [bud_e/text.py](bud_e/text.py) | Sentence splitting, hiding `<think>`, cleaning text for speech |
+| [bud_e/commands.py](bud_e/commands.py) | Instant answers that skip the model (stop, time, date) |
+| [bud_e/audio.py](bud_e/audio.py) | Mic and voice detection; the interruptible speech player |
+| [bud_e/asr.py](bud_e/asr.py) | Whisper: MLX on Mac, faster-whisper (CUDA or CPU) elsewhere |
+| [bud_e/tts.py](bud_e/tts.py) | Kokoro, or the macOS `say` voice |
+| [bud_e/speaker_id.py](bud_e/speaker_id.py) | Optional voice check: enrol, calibrate |
+| [bud_e/assistant.py](bud_e/assistant.py) | The voice loop that connects all of the above |
+| [bud_e/bench.py](bud_e/bench.py) | Model benchmark |
+| [bud_e/turnlog.py](bud_e/turnlog.py) | Per-turn timing and `bud-e stats` |
+| [tests/](tests/) | `uv run pytest`. Runs without a server, mic or GPU |
 
-## Environment
-
-| var | default |
-| --- | --- |
-| `BUD_E_BASE` | read from `~/.omlx/settings.json` (port 8250 here) |
-| `BUD_E_API_KEY` | read from `~/.omlx/settings.json` |
-| `BUD_E_MODEL` | `Qwen3.8-27B-MLX-4bit` |
-| `BUD_E_HOME` | `~/.bud-e` |
-
-## Deliberately not enabled
-
-No shell tool in the agent, and `terminal` is absent from `HERMES_TOOLSETS`.
-Voice dispatch means no human reads the command before it runs. File tools
-are read-only and fenced to `BUD_E_READ_ROOTS`. Add shell access on purpose, with the Docker
-mount list decided, not because a turn failed and shell would have fixed it.
+Everything Bud-E saves lives in `~/.bud-e/` (or `$BUD_E_HOME`): config,
+memory, notes, vocabulary, voiceprint, turn log and bench results.
