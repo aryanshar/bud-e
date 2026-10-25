@@ -148,6 +148,9 @@ git clone git@github.com:aryanshar/bud-e.git && cd bud-e
 uv sync --extra voice                    # add --extra speaker for the voice check
 ```
 
+`uv sync` installs exactly the extras you name and removes the rest. If you
+use the voice check, include `--extra speaker` every time you sync.
+
 **macOS** needs nothing else. The first time you run it, macOS asks to let
 your terminal use the microphone, and later Calendar and Reminders. For
 calendar events that repeat, also run `brew install ical-buddy`.
@@ -315,10 +318,12 @@ at the CUDA libraries that came with PyTorch:
 export LD_LIBRARY_PATH=$(uv run python -c 'import os, nvidia.cublas.lib, nvidia.cudnn.lib; print(os.path.dirname(nvidia.cublas.lib.__file__) + ":" + os.path.dirname(nvidia.cudnn.lib.__file__))')
 ```
 
-**Kokoro fails on first run.** It downloads a small English language model
-the first time. That needs internet once, and `pip` in the venv (the voice
-extra installs it). If Kokoro still won't load, Bud-E falls back to the
-macOS `say` voice. On Linux it prints replies instead of speaking.
+**Startup hangs after loading, or Kokoro won't load.** Kokoro needs spaCy's
+small English model (`en-core-web-sm`), which the voice extra installs. If
+the model is missing, Kokoro tries to download it on every start and can
+hang there. Re-run `uv sync --extra voice` (plus any other extras you use).
+If Kokoro still won't load, Bud-E falls back to the macOS `say` voice. On
+Linux it prints replies instead of speaking.
 
 ## Project layout
 

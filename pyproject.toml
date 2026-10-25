@@ -24,12 +24,13 @@ voice = [
     "mlx-whisper>=0.4; sys_platform == 'darwin'",
     "faster-whisper>=1.1; sys_platform != 'darwin'",
     "kokoro>=0.9",
-    # preshed 3.0.14 breaks loading spaCy's English model, which Kokoro
-    # needs ("OverflowError: Python int too large"). Lift once fixed.
+    # Kokoro's text front end needs spaCy's small English model. Without it
+    # installed, it tries to download one on every start, and `uv sync`
+    # removes any copy it downloads.
+    "en-core-web-sm",
+    # preshed 3.0.14 breaks loading that model ("OverflowError: Python int
+    # too large"). Lift once fixed.
     "preshed<3.0.14",
-    # Kokoro's text front end downloads a spaCy model with pip on first run,
-    # and uv-made venvs don't include pip.
-    "pip",
 ]
 # Optional: only answer your voice (ECAPA speaker verification).
 speaker = [
@@ -51,3 +52,7 @@ packages = ["bud_e"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv.sources]
+# Not on PyPI; spaCy publishes its models as GitHub release wheels.
+en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }

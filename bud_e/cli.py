@@ -13,7 +13,26 @@ from bud_e import config
 EXAMPLE = Path(__file__).with_name("config.example.toml")
 
 
+def _quiet_libraries() -> None:
+    """torch, Hugging Face and friends print warnings at load time that look
+    like errors but aren't. Hide them so real problems stand out."""
+    import logging
+    import os
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning)
+    warnings.filterwarnings("ignore", category=FutureWarning)
+    # Both of these set their own log levels on import, so levels set here
+    # get overridden: use HF's env var, and a filter for torch's macOS note.
+    os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    logging.getLogger("torch.distributed.elastic.multiprocessing.redirects"
+                      ).addFilter(lambda record: False)
+    for name in ("speechbrain", "phonemizer"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+
 def main() -> None:
+    _quiet_libraries()
     p = argparse.ArgumentParser(prog="bud-e", description=__doc__)
     p.add_argument("--config", type=Path, help="config file to use")
     sub = p.add_subparsers(dest="cmd", required=True)
