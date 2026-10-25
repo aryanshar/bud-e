@@ -1,0 +1,7 @@
+.venv/
+jarvis/
+_backups/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.DS_Store

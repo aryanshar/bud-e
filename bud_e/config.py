@@ -1,126 +1,194 @@
-"""Every tunable lives here. The bench and the pipeline read the same values."""
+"""All settings, loaded once from ~/.bud-e/config.toml.
 
+Every key is optional. Defaults live in the dataclasses below, so this file is
+also the reference for what can be set. A few environment variables override
+the file, which is handy for trying another model without editing anything:
+
+    BUD_E_CONFIG    path to the config file
+    BUD_E_HOME      where state lives (default ~/.bud-e)
+    BUD_E_BASE_URL  model server, e.g. http://localhost:11434/v1
+    BUD_E_MODEL     model id as the server lists it
+    BUD_E_API_KEY   key for the model server, if it wants one
+"""
+
+from __future__ import annotations
+
+import json
 import os
+import platform
+import tomllib
+from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
+from urllib.parse import urlparse
+
+IS_MAC = platform.system() == "Darwin"
+IS_LINUX = platform.system() == "Linux"
 
 
-def _env_bool(name: str, default: str) -> bool:
-    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes")
+@dataclass
+class LLM:
+    base_url: str = "http://localhost:11434/v1"
+    model: str = ""            # empty: use the first model the server lists
+    api_key: str = ""
+    temperature: float = 0.7
+    top_p: float = 0.8
+    max_tokens: int = 400
+    timeout: float = 120.0
+    # Sent with every request. The default turns off Qwen-style thinking,
+    # which on a voice path is just silence. Servers that don't know the
+    # field ignore it; if yours rejects it, set extra_body = {}.
+    extra_body: dict = field(default_factory=lambda: {
+        "chat_template_kwargs": {"enable_thinking": False}})
 
 
-# --- inference (oMLX) ----------------------------------------------------
-# Port and API key come from oMLX's own settings so they never drift. The
-# model id is the folder name under ~/.omlx/models; `bud-e doctor` lists them.
-OMLX_SETTINGS = Path.home() / ".omlx" / "settings.json"
+@dataclass
+class Assistant:
+    name: str = "Bud-E"
+    wake_words: list[str] = field(
+        default_factory=lambda: ["bud-e", "buddy", "jarvis"])
+    followup_seconds: float = 30.0     # no wake word needed inside this
+    history_turns: int = 12
+    max_tool_steps: int = 5
+    persona: str = ""                  # extra style notes for the prompt
 
 
-def _omlx() -> dict:
+@dataclass
+class User:
+    name: str = ""                     # what it calls you
+    address: str = ""                  # e.g. "sir", used sparingly
+    location: str = ""                 # place name for weather
+    latitude: float | None = None
+    longitude: float | None = None
+
+
+@dataclass
+class Voice:
+    asr: str = "auto"                  # auto | mlx-whisper | faster-whisper
+    whisper_model: str = "large-v3-turbo"
+    language: str = "en"
+    tts: str = "auto"                  # auto | kokoro | say | none
+    kokoro_voice: str = "bm_george"    # a/b prefix = American/British
+    kokoro_speed: float = 1.05
+    say_voice: str = "Daniel"          # macOS `say` fallback
+    vad_threshold: float = 0.5
+    silence_ms: int = 450              # pause that ends your turn
+    min_speech_s: float = 0.6
+    max_speech_s: float = 20.0
+    barge_rms: float = 0.03            # loudness that counts as you talking
+    barge_rms_speaking: float = 0.08   # same, while it is talking (echo)
+    speaker_check: str = "auto"        # auto (on once enrolled) | on | off
+    input_device: str = ""             # name or index; empty = default
+    output_device: str = ""
+
+
+@dataclass
+class Tools:
+    read_roots: list[str] = field(
+        default_factory=lambda: ["~/Documents", "~/Desktop", "~/Downloads"])
+    searxng_url: str = ""              # local SearXNG enables web_search
+    disabled: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Config:
+    llm: LLM = field(default_factory=LLM)
+    assistant: Assistant = field(default_factory=Assistant)
+    user: User = field(default_factory=User)
+    voice: Voice = field(default_factory=Voice)
+    tools: Tools = field(default_factory=Tools)
+    home: Path = Path.home() / ".bud-e"
+    source: Path | None = None         # the file it was loaded from
+
+    # --- state files -----------------------------------------------------
+    @property
+    def memory_path(self) -> Path:
+        return self.home / "memory.md"
+
+    @property
+    def notes_path(self) -> Path:
+        return self.home / "notes.md"
+
+    @property
+    def vocab_path(self) -> Path:
+        return self.home / "vocab.txt"
+
+    @property
+    def voiceprint_path(self) -> Path:
+        return self.home / "voiceprint.npy"
+
+    @property
+    def threshold_path(self) -> Path:
+        return self.home / "threshold.txt"
+
+    @property
+    def turn_log(self) -> Path:
+        return self.home / "turns.jsonl"
+
+    @property
+    def read_roots(self) -> list[Path]:
+        return [Path(p).expanduser() for p in self.tools.read_roots]
+
+    def ensure_home(self) -> None:
+        self.home.mkdir(parents=True, exist_ok=True)
+
+
+def _merge(obj, data: dict, where: str) -> None:
+    """Copy known keys from a TOML table onto a dataclass, recursively."""
+    known = {f.name: f for f in fields(obj)}
+    for key, value in data.items():
+        if key not in known:
+            print(f"  [config] unknown key {where}{key}, ignored")
+            continue
+        current = getattr(obj, key)
+        if is_dataclass(current) and isinstance(value, dict):
+            _merge(current, value, f"{where}{key}.")
+        else:
+            setattr(obj, key, value)
+
+
+def _omlx_key(base_url: str) -> str:
+    """oMLX keeps its API key in its own settings file. Reading it saves
+    copying a secret around when the server is oMLX on this machine."""
+    p = Path.home() / ".omlx" / "settings.json"
+    if not p.exists():
+        return ""
     try:
-        import json
-        return json.loads(OMLX_SETTINGS.read_text())
+        s = json.loads(p.read_text())
+        if urlparse(base_url).port == s.get("server", {}).get("port"):
+            return s.get("auth", {}).get("api_key", "")
     except Exception:
-        return {}
+        pass
+    return ""
 
 
-_om = _omlx()
-_port = _om.get("server", {}).get("port", 8000)
-LOCAL_BASE = os.environ.get("BUD_E_BASE", f"http://localhost:{_port}/v1")
-LOCAL_MODEL = os.environ.get("BUD_E_MODEL", "Qwen3.8-27B-MLX-4bit")
-API_KEY = (os.environ.get("BUD_E_API_KEY")
-           or _om.get("auth", {}).get("api_key") or "local")
-
-# Qwen's published sampling. Non-thinking for normal turns, thinking for the
-# turns the router marks as depth. Sent per request so the server's per-model
-# defaults cannot silently drift.
-SAMPLING = {
-    False: dict(temperature=0.7, top_p=0.8, top_k=20, min_p=0.0,
-                presence_penalty=float(os.environ.get("BUD_E_PRESENCE", "1.5"))),
-    True: dict(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0,
-               presence_penalty=0.0),
-}
-
-# --- agent tier (27B, direct, streamed, native tool calls) ---------------
-AGENT_MAX_TOKENS = int(os.environ.get("BUD_E_MAX_TOKENS", "512"))
-AGENT_THINK_MAX_TOKENS = int(os.environ.get("BUD_E_THINK_MAX_TOKENS", "4096"))
-AGENT_MAX_STEPS = 5          # tool round trips per turn; local models loop
-AGENT_HISTORY = int(os.environ.get("BUD_E_HISTORY", "12"))     # turns kept
-TOOL_RESULT_CHARS = 6000     # long tool output costs prefill on every step
-
-# --- fast tier (optional) ------------------------------------------------
-# Small model, ~200 token prompt, no tools. Only worth keeping if the 27B's
-# warm time-to-first-token is above ~0.8s. `bud-e latency` measures it.
-FAST_TIER = _env_bool("BUD_E_FAST_TIER", "1")
-FAST_MODEL = os.environ.get("BUD_E_FAST_MODEL", "gemma-4-E4B-it-MLX-4bit")
-FAST_MAX_TOKENS = int(os.environ.get("BUD_E_FAST_MAX_TOKENS", "160"))
-FAST_HISTORY = int(os.environ.get("BUD_E_FAST_HISTORY", "8"))   # message pairs
-ROUTE_TOKEN = "ROUTE"
-
-# --- tools ---------------------------------------------------------------
-# read_file and find_files never leave these roots.
-READ_ROOTS = [Path(p).expanduser() for p in os.environ.get(
-    "BUD_E_READ_ROOTS", "~/Documents:~/Desktop:~/Downloads").split(":") if p]
-WEATHER_LAT = float(os.environ.get("BUD_E_LAT", "12.9716"))
-WEATHER_LON = float(os.environ.get("BUD_E_LON", "77.5946"))
-WEATHER_PLACE = os.environ.get("BUD_E_PLACE", "Bengaluru")
-# Local SearXNG instance, e.g. http://localhost:8888. Empty = no web tool.
-SEARXNG_URL = os.environ.get("BUD_E_SEARXNG", "").rstrip("/")
-
-# --- hermes (background delegate only, never on the voice path) ----------
-HERMES_DELEGATE = _env_bool("BUD_E_DELEGATE", "1")
-HERMES_SESSION = os.environ.get("BUD_E_SESSION", "bud-e-background")
-HERMES_TOOLSETS = os.environ.get("BUD_E_TOOLSETS", "file,web,skills,memory")
-VOICE_SKILL = "bud-e-voice"
-HERMES_TIMEOUT_S = int(os.environ.get("BUD_E_DELEGATE_TIMEOUT", "900"))
-
-# --- audio -------------------------------------------------------------
-SR = 16_000
-FRAME = 512                  # Silero requires exactly 512 samples at 16 kHz
-MIN_SPEECH_S = 1.2           # below this, speaker verification is a coin flip
-MAX_SPEECH_S = 20.0
-FOLLOWUP_WINDOW_S = 30       # wake phrase not needed inside this window
-DEFAULT_THRESHOLD = 0.35     # placeholder only; calibrate overwrites it
-
-VAD_THRESHOLD = float(os.environ.get("BUD_E_VAD", "0.5"))
-VAD_SILENCE_MS = int(os.environ.get("BUD_E_SILENCE_MS", "450"))
-BARGE_RMS = float(os.environ.get("BUD_E_BARGE_RMS", "0.03"))
-
-# While Bud-E is speaking, its own voice reaches the mic. Interrupting then
-# needs real loudness; raise it if Bud-E cuts itself off, or wear headphones.
-BARGE_RMS_SPEAKING = float(os.environ.get("BUD_E_BARGE_RMS_SPEAKING", "0.08"))
-
-# kokoro: neural, natural, local (pip install mlx-audio). say: macOS fallback.
-TTS_ENGINE = os.environ.get("BUD_E_TTS", "kokoro")
-KOKORO_REPO = os.environ.get("BUD_E_KOKORO", "mlx-community/Kokoro-82M-bf16")
-KOKORO_VOICE = os.environ.get("BUD_E_KOKORO_VOICE", "bm_george")  # British male
-KOKORO_LANG = os.environ.get("BUD_E_KOKORO_LANG", "b")            # b = British
-KOKORO_SPEED = float(os.environ.get("BUD_E_KOKORO_SPEED", "1.05"))
-TTS_VOICE = os.environ.get("BUD_E_VOICE", "Daniel")
-TTS_RATE = int(os.environ.get("BUD_E_RATE", "195"))
-
-# --- persona -----------------------------------------------------------
-ADDRESS = os.environ.get("BUD_E_ADDRESS", "sir")
-PERSONA = os.environ.get("BUD_E_PERSONA", "").strip()
-
-# --- asr ---------------------------------------------------------------
-WHISPER_REPO = os.environ.get("BUD_E_WHISPER",
-                              "mlx-community/whisper-large-v3-turbo")
-ASR_LANGUAGE = os.environ.get("BUD_E_LANG", "en")
-
-# --- state -------------------------------------------------------------
-HOME = Path(os.environ.get("BUD_E_HOME", Path.home() / ".bud-e"))
-PRINT_PATH = HOME / "voiceprint.npy"
-THRESH_PATH = HOME / "threshold.txt"
-ECAPA_DIR = HOME / "ecapa"
-TURN_LOG = HOME / "turns.jsonl"
-VOCAB_PATH = HOME / "vocab.txt"
-MEMORY_PATH = HOME / "memory.md"
-NOTES_PATH = HOME / "notes.md"
-INBOX_PATH = HOME / "inbox.md"       # finished background (Hermes) jobs
-
-REPO = Path(__file__).resolve().parent.parent
-RESULTS = REPO / "results"
+def config_path() -> Path:
+    if os.environ.get("BUD_E_CONFIG"):
+        return Path(os.environ["BUD_E_CONFIG"]).expanduser()
+    home = Path(os.environ.get("BUD_E_HOME", Path.home() / ".bud-e"))
+    return home.expanduser() / "config.toml"
 
 
-def ensure_dirs() -> None:
-    HOME.mkdir(parents=True, exist_ok=True)
-    RESULTS.mkdir(parents=True, exist_ok=True)
+def load(path: Path | None = None) -> Config:
+    cfg = Config()
+    if os.environ.get("BUD_E_HOME"):
+        cfg.home = Path(os.environ["BUD_E_HOME"]).expanduser()
+
+    path = path or config_path()
+    if path.exists():
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+        if "home" in data:
+            data["home"] = Path(data["home"]).expanduser()
+        _merge(cfg, data, "")
+        cfg.source = path
+
+    env = {"BUD_E_BASE_URL": "base_url", "BUD_E_MODEL": "model",
+           "BUD_E_API_KEY": "api_key"}
+    for var, key in env.items():
+        if os.environ.get(var):
+            setattr(cfg.llm, key, os.environ[var])
+
+    cfg.llm.base_url = cfg.llm.base_url.rstrip("/")
+    if not cfg.llm.api_key:
+        cfg.llm.api_key = _omlx_key(cfg.llm.base_url) or "local"
+    return cfg

@@ -1,0 +1,59 @@
+# Bud-E config. Lives at ~/.bud-e/config.toml (or $BUD_E_CONFIG).
+# Every key is optional; the values shown are the defaults unless marked.
+
+[llm]
+# Any OpenAI-compatible server. Common local ones:
+#   Ollama        http://localhost:11434/v1
+#   LM Studio     http://localhost:1234/v1
+#   mlx_lm.server http://localhost:8080/v1
+#   llama-server  http://localhost:8080/v1
+#   vLLM          http://localhost:8000/v1
+#   oMLX          http://localhost:<port in ~/.omlx/settings.json>/v1
+base_url = "http://localhost:11434/v1"
+# The model id exactly as the server lists it (`bud-e doctor` shows them).
+# Empty means "whatever the server lists first".
+model = ""
+# Only if your server wants one. oMLX's key is read from its settings file.
+api_key = ""
+temperature = 0.7
+top_p = 0.8
+max_tokens = 400
+# Sent with every request. This turns off Qwen-style "thinking", which on a
+# voice assistant is just silence. Set to {} if your server rejects it.
+extra_body = { chat_template_kwargs = { enable_thinking = false } }
+
+[assistant]
+name = "Bud-E"
+wake_words = ["bud-e", "buddy", "jarvis"]
+followup_seconds = 30     # after a reply, no wake word needed for this long
+history_turns = 12
+max_tool_steps = 5
+persona = ""              # e.g. "Drier than that. Never enthusiastic."
+
+[user]
+name = ""                 # what it calls you, e.g. "Sam"
+address = ""              # e.g. "sir"; used now and then as a dry touch
+location = ""             # e.g. "Bengaluru"
+# Set both to turn on the weather tool (Open-Meteo, no key needed).
+# latitude = 12.9716
+# longitude = 77.5946
+
+[voice]
+asr = "auto"              # auto | mlx-whisper (Mac) | faster-whisper
+whisper_model = "large-v3-turbo"   # "small.en" is faster on a CPU-only box
+language = "en"
+tts = "auto"              # auto (kokoro, then macOS say) | kokoro | say | none
+kokoro_voice = "bm_george"         # af_heart, bf_emma, bm_lewis, am_michael...
+kokoro_speed = 1.05
+say_voice = "Daniel"
+silence_ms = 450          # pause that ends your turn; lower is snappier
+barge_rms = 0.03          # how loud counts as you talking
+barge_rms_speaking = 0.08 # same while it talks; raise if it interrupts itself
+speaker_check = "auto"    # auto (on once you've run `bud-e enrol`) | on | off
+input_device = ""         # name or index from `python -m sounddevice`
+output_device = ""
+
+[tools]
+read_roots = ["~/Documents", "~/Desktop", "~/Downloads"]
+searxng_url = ""          # e.g. http://localhost:8888 turns on web_search
+disabled = []             # e.g. ["read_file", "find_files"]

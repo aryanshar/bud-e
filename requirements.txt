@@ -1,5 +1,0 @@
-# Base: enough to benchmark models. No audio stack, no torch.
-#   uv pip install -r requirements.txt
-openai>=1.60
-numpy>=2.0
-pyyaml>=6.0
